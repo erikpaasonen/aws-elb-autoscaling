@@ -1,0 +1,4771 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Creates VPC, Subnets, Route Tables, SG, Classic ELB and Application ELB, ASG
+  for Webservers and Lambda Infrastructure for the VM-Series firewall
+Parameters:
+  InstanceType:
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t1.micro
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - m1.large
+      - m3.xlarge
+      - c4.2xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+  KeyPANWFirewall:
+    Type: String
+    Description: >-
+      API Key associated to username/password of the VM-Series Firewall. By
+      default it is pandemo/demopassword
+    Default: >-
+      LUFRPT1Zd2pYUGpkMUNrVEZlb3hROEQyUm95dXNGRkU9N0d4RGpTN2VZaVZYMVVoS253U0p6dlk3MkM0SDFySEh2UUR4Y3hzK2g3ST0=
+    AllowedPattern: '[\S0-9a-zA-Z]+'
+    ConstraintDescription: The PAN FW API key is required.
+    NoEcho: 'true'
+  MinInstancesASG:
+    Type: Number
+    Default: '1'
+    Description: Minimum number of VM-Series firewalls in the ASG
+  MaximumInstancesASG:
+    Type: Number
+    Default: '3'
+    Description: Maximum number of VM-Series firewalls in the ASG
+  ScalingPeriod:
+    Type: String
+    Default: '900'
+    Description: >-
+      The period in seconds over which the average statistic is applied. Must be
+      multiple of 60
+  ScaleUpThreshold:
+    Type: Number
+    Default: '80'
+    Description: Value at which ScaleUp event would take place
+  ScaleDownThreshold:
+    Type: Number
+    Default: '20'
+    Description: Value at which ScaleDown event would take place
+  ScalingParameter:
+    Type: String
+    Default: ActiveSessions
+    AllowedValues:
+      - DataPlaneCPUUtilization
+      - ActiveSessions
+      - DataPlaneBufferUtilization
+    Description: Refer to guide for recommended values for ScaleUp and ScaleDown
+  KeyPANWPanorama:
+    Type: String
+    Description: >-
+      API Key associated to username/password of the Panorama. By default it is
+      admin/admin
+    NoEcho: 'true'
+  KeyDeLicense:
+    Type: String
+    Default: ''
+    Description: Key used to de-license the PAN FW
+    NoEcho: 'true'
+  MasterS3Bucket:
+    Type: String
+    Description: Enter the name of the Bootstrap S3 bucket for the VM-Series firewall
+    MinLength: '3'
+    MaxLength: '63'
+  FWInstanceType:
+    Type: String
+    Default: m4.xlarge
+    AllowedValues:
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - m3.xlarge
+      - m3.2xlarge
+      - c4.xlarge
+      - c4.2xlarge
+      - c4.4xlarge
+      - c3.xlarge
+      - c3.2xlarge
+      - c3.4xlarge
+    Description: Enter the instance type and size that you want for VM-Series firewall
+  PanFwAmiId:
+    Type: 'AWS::EC2::Image::Id'
+    Description: >-
+      Link to Ami Id lookup table:
+      https://www.paloaltonetworks.com/documentation/global/compatibility-matrix/vm-series-firewalls/aws-cft-amazon-machine-images-ami-list
+  ELBName:
+    Type: String
+    Description: Enter the name of the External Classic Load Balancer
+    Default: public-elb
+    MinLength: '3'
+    MaxLength: '12'
+  ILBName:
+    Type: String
+    Description: Enter the name of the internal Application Load Balancer
+    Default: private-ilb
+    MinLength: '3'
+    MaxLength: '12'
+  KeyName:
+    Description: Amazon EC2 Key Pair
+    Type: 'AWS::EC2::KeyPair::KeyName'
+  PanS3BucketTpl:
+    Description: >-
+      VM-Series firewall Lambda/Scripts/CFT template S3 Bucket or your own in
+      the same region
+    Type: String
+    MinLength: '3'
+    MaxLength: '63'
+  SSHLocation:
+    Description: >-
+      Restrict SSH access to the VM-Series firewall (by default can be accessed
+      from anywhere)
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid CIDR range of the form x.x.x.x/x.
+  NumberOfAZs:
+    Description: >-
+      Total Number of AZs which will be used in this deployment (Min 2 and Max
+      3)
+    Type: Number
+    MinValue: '2'
+    Default: '2'
+    MaxValue: '3'
+  VpcAzs:
+    Type: 'List<AWS::EC2::AvailabilityZone::Name>'
+    Description: Enter the list of Availability Zones (Based on Number of AZs above)
+  VPCName:
+    Description: Name of the newly created VPC
+    Type: String
+    MinLength: '6'
+    MaxLength: '24'
+    Default: panwVPC
+  VPCCIDR:
+    Type: String
+    Default: 192.168.0.0/16
+    Description: Enter the VPC CIDR that you want to use
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid CIDR range of the form x.x.x.x/x.
+  MgmtSubnetIpBlocks:
+    Description: Management subnet comma-delimited list of CIDR blocks
+    Type: CommaDelimitedList
+    Default: '192.168.0.0/24, 192.168.10.0/24, 192.168.20.0/24'
+  UntrustSubnetIpBlocks:
+    Description: Untrust subnet comma-delimited list of CIDR blocks
+    Type: CommaDelimitedList
+    Default: '192.168.1.0/24, 192.168.11.0/24, 192.168.21.0/24'
+  TrustSubnetIpBlocks:
+    Description: Trust subnet comma-delimited list of CIDR blocks
+    Type: CommaDelimitedList
+    Default: '192.168.2.0/24, 192.168.12.0/24, 192.168.22.0/24'
+  NATGWSubnetIpBlocks:
+    Description: AWS NAT Gateway Comma-delimited list of CIDR blocks
+    Type: CommaDelimitedList
+    Default: '192.168.100.0/24, 192.168.101.0/24, 192.168.102.0/24'
+  LambdaSubnetIpBlocks:
+    Description: >-
+      Lambda Funcion Subnets for AZ: Comma-delimited list of CIDR blocks only if
+      NAT Gateway is needed
+    Type: CommaDelimitedList
+    Default: '192.168.200.0/24, 192.168.201.0/24, 192.168.202.0/24'
+  NATGateway:
+    Type: String
+    Default: 'Yes'
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+    Description: >-
+      Yes = create AWS NAT Gateway in each AZ, No = Use EIPs (skip subnet CIDR
+      for NAT/Lambda)
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: VPC Configuration
+        Parameters:
+          - VPCName
+          - VPCCIDR
+          - MgmtSubnetIpBlocks
+          - UntrustSubnetIpBlocks
+          - TrustSubnetIpBlocks
+          - NATGateway
+          - NATGWSubnetIpBlocks
+          - LambdaSubnetIpBlocks
+          - NumberOfAZs
+          - VpcAzs
+      - Label:
+          default: VM-Series Firewall Instance Configuration
+        Parameters:
+          - FWInstanceType
+          - PanFwAmiId
+          - KeyDeLicense
+          - KeyName
+          - SSHLocation
+      - Label:
+          default: S3 Bucket details
+        Parameters:
+          - MasterS3Bucket
+          - PanS3BucketTpl
+      - Label:
+          default: VM-Series API Key
+        Parameters:
+          - KeyPANWFirewall
+          - KeyPANWPanorama
+      - Label:
+          default: Load Balancer Configuration
+        Parameters:
+          - ELBName
+          - ILBName
+      - Label:
+          default: Auto Scaling Group Configuration
+        Parameters:
+          - ScalingParameter
+          - ScalingPeriod
+          - MaximumInstancesASG
+          - MinInstancesASG
+          - ScaleDownThreshold
+          - ScaleUpThreshold
+      - Label:
+          default: Web Server Configuration
+        Parameters:
+          - InstanceType
+    ParameterLabels:
+      VPCName:
+        default: 'VPC Name:'
+      VPCCIDR:
+        default: 'CIDR Block for the VPC:'
+      MgmtSubnetIpBlocks:
+        default: 'Management Subnet CIDR Block:'
+      UntrustSubnetIpBlocks:
+        default: 'Untrust Subnet CIDR Block:'
+      TrustSubnetIpBlocks:
+        default: 'Trust Subnet CIDR Block:'
+      NATGWSubnetIpBlocks:
+        default: 'NAT Gateway Subnet CIDR Block:'
+      LambdaSubnetIpBlocks:
+        default: 'Lambda Subnet CIDR Block:'
+      FWInstanceType:
+        default: 'Firewall Instance size:'
+      PanFwAmiId:
+        default: The Ami Id of the PAN FW Image
+      KeyDeLicense:
+        default: Key used to de-license the FW
+      InstanceType:
+        default: 'Instance Type of Web Servers behind ILB:'
+      KeyName:
+        default: 'Key pair:'
+      SSHLocation:
+        default: 'SSH From:'
+      MasterS3Bucket:
+        default: Bootstrap bucket for VM-Series firewalls
+      PanS3BucketTpl:
+        default: 'S3 Bucket Name for templates and AWS Lambda:'
+      KeyPANWFirewall:
+        default: 'API Key for Firewall:'
+      KeyPANWPanorama:
+        default: 'API Key for Panorama:'
+      ELBName:
+        default: 'Name of External Load Balancer:'
+      ILBName:
+        default: 'Name of Internal Application Load Balancer:'
+      NATGateway:
+        default: Do you want to create AWS NAT Gateway in each Availability Zones (AZ)?
+      ILBType:
+        default: Use Classic or Application load balancer for internal load balancer?
+      VpcAzs:
+        default: 'Select list of AZ:'
+      NumberOfAZs:
+        default: 'Number of AZ for deployment:'
+      ScalingParameter:
+        default: 'Choose your Scaling Parameter:'
+      ScalingPeriod:
+        default: 'Choose time in seconds for Scaling Period:'
+      MinInstancesASG:
+        default: 'Minimum VM-Series Instances:'
+      MaximumInstancesASG:
+        default: 'Maximum VM-Series Instances:'
+      ScaleUpThreshold:
+        default: 'ScaleUp threshold value in percentage/value:'
+      ScaleDownThreshold:
+        default: 'ScaleDown threshold value in percentage/value:'
+  'AWS::CloudFormation::Designer':
+    579976df-4a9a-4e2b-9d6c-1a81865f0721:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 90
+      z: 1
+      embeds: []
+    89ae6514-302b-419e-aeb8-37306520839e:
+      size:
+        width: 1770
+        height: 1770
+      position:
+        x: 50
+        'y': -330
+      z: 1
+      embeds:
+        - 77f7141e-c1a3-4429-b0ef-a574c2b48aaf
+        - 5e7792f9-3460-48f6-8e57-a3092d3803d1
+        - bd247bfa-1079-48e3-b591-21fd1743da77
+        - ce89aacf-ec04-4a57-a596-6508eaf0c356
+        - e2ca73a4-ea76-4319-b429-690466d1ef04
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - ea7b5728-5fbb-4198-af34-0260fba4afe6
+        - 92f88bdb-1562-474f-a85e-7f7d9d3c1659
+        - e4adb218-a16d-4ba4-9d4e-83a91f7aef8f
+        - f2f56ed0-499f-4594-9a95-c8f84bb1f073
+        - 10ffddce-64c0-442a-bd36-1ba4b904cfb7
+        - b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - e240f2ba-76fd-461e-be69-91f76dec57c2
+        - 2432aece-72dc-4f76-ab66-f76253766eff
+        - a13b0c43-203c-4071-8248-cd553016ec26
+        - 27f2dbba-c4c6-4ca7-bb1d-64a3fa28a6fc
+        - 281f5058-560e-4522-9c1b-774532ff8dda
+        - 7f9a3041-5610-4f2b-9e3d-0303985682b0
+        - dd75bead-f747-40bc-a88a-9e01419bd8bc
+        - 290d4d9b-1a1a-4c85-8f71-f2af96a5262a
+        - 48a88552-008d-4bcd-a8c9-704eedc6d586
+        - ac8206e5-bbae-49b1-9220-625f5c6533ee
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 5256dcaf-a85c-4669-9c23-fd566e610320
+        - 2f8452b9-e59a-472e-aaf3-68ccacfe54d9
+        - 4be73a31-4ece-402c-a762-ebc1c4a95db0
+        - 201e86af-a966-4e80-85ad-281e4ebd3723
+        - bfde668d-28f2-4927-bfe6-f124ba827bd7
+        - 6705e751-a57c-4bb0-b619-613802d91a16
+        - afdabb17-af10-4c11-a8aa-2667cdf87ce6
+        - 6e83f5bd-4c6b-4e5f-b663-1db85f87e207
+        - 63cace10-74a0-4e19-bff1-62306a6a9a9f
+        - 43a4ef37-ff51-43a4-886c-a95d6718aa05
+        - 30929453-52e7-4bcd-912f-6b161585b551
+        - 4246edda-7b78-4c75-bcb7-a310e227539e
+    87f50c88-a4cf-42b4-b43a-4febfad4e0ff:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 210
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    77f7141e-c1a3-4429-b0ef-a574c2b48aaf:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1670
+        'y': -270
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+    1e321b48-5a13-4122-8982-582d16308bd8:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 330
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 77f7141e-c1a3-4429-b0ef-a574c2b48aaf
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+    5e7792f9-3460-48f6-8e57-a3092d3803d1:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1670
+        'y': -150
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    bd247bfa-1079-48e3-b591-21fd1743da77:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1670
+        'y': -30
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    ce89aacf-ec04-4a57-a596-6508eaf0c356:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 1280
+        'y': 330
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 7b7a8878-b312-4d70-9756-dd6e678eed59
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    7b7a8878-b312-4d70-9756-dd6e678eed59:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1310
+        'y': 390
+      z: 3
+      parent: ce89aacf-ec04-4a57-a596-6508eaf0c356
+      embeds: []
+      references:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+      dependson:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+        - ce89aacf-ec04-4a57-a596-6508eaf0c356
+    e2ca73a4-ea76-4319-b429-690466d1ef04:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 80
+        'y': 1140
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+    35a6165b-dd7c-45f9-b832-6afacfc77b9f:
+      source:
+        id: ce89aacf-ec04-4a57-a596-6508eaf0c356
+      target:
+        id: e2ca73a4-ea76-4319-b429-690466d1ef04
+    e352ebb8-bb2c-40e5-b77a-99274eb4990f:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1550
+        'y': 1050
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+    7a2ab225-2200-4aef-b30f-63f293bc3d44:
+      source:
+        id: ce89aacf-ec04-4a57-a596-6508eaf0c356
+      target:
+        id: e352ebb8-bb2c-40e5-b77a-99274eb4990f
+    960e6c66-b286-4bc0-97cb-b8781f49aff8:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1580
+        'y': 360
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+    852cf89d-534b-4572-85df-5abff5de2c44:
+      source:
+        id: ce89aacf-ec04-4a57-a596-6508eaf0c356
+      target:
+        id: 960e6c66-b286-4bc0-97cb-b8781f49aff8
+    e72075c6-799e-4adc-a10f-5c9121777974:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1580
+        'y': 150
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+    21e35cde-5da0-4fd1-971c-64e775d6306c:
+      source:
+        id: ce89aacf-ec04-4a57-a596-6508eaf0c356
+      target:
+        id: e72075c6-799e-4adc-a10f-5c9121777974
+    ea7b5728-5fbb-4198-af34-0260fba4afe6:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 1160
+        'y': 30
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 0684fad7-4e73-49b4-a8ba-9a1d87fc0de6
+    92f88bdb-1562-474f-a85e-7f7d9d3c1659:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1460
+        'y': 150
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      isassociatedwith:
+        - ea7b5728-5fbb-4198-af34-0260fba4afe6
+    e4adb218-a16d-4ba4-9d4e-83a91f7aef8f:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1130
+        'y': 930
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      isassociatedwith:
+        - ea7b5728-5fbb-4198-af34-0260fba4afe6
+    f2f56ed0-499f-4594-9a95-c8f84bb1f073:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 290
+        'y': 1140
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      isassociatedwith:
+        - ea7b5728-5fbb-4198-af34-0260fba4afe6
+    0684fad7-4e73-49b4-a8ba-9a1d87fc0de6:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1190
+        'y': 90
+      z: 3
+      parent: ea7b5728-5fbb-4198-af34-0260fba4afe6
+      embeds: []
+      references:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+      dependson:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+        - ea7b5728-5fbb-4198-af34-0260fba4afe6
+    10ffddce-64c0-442a-bd36-1ba4b904cfb7:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1340
+        'y': 1050
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    1833fc8f-a775-426e-a0d6-b161e3c24dac:
+      source:
+        id: ea7b5728-5fbb-4198-af34-0260fba4afe6
+      target:
+        id: 10ffddce-64c0-442a-bd36-1ba4b904cfb7
+    b365697e-3e78-4fe3-af7c-fc87ec4c0b96:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1130
+        'y': 1050
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    f101a7ba-cac7-4c9d-b79b-4000349edfb4:
+      source:
+        id: ea7b5728-5fbb-4198-af34-0260fba4afe6
+      target:
+        id: b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+    2a68ac80-7331-4af6-85e2-fc612bf487d3:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1490
+        'y': 840
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    f8e8bee8-89ac-4d31-9cd9-4d521463106d:
+      source:
+        id: ea7b5728-5fbb-4198-af34-0260fba4afe6
+      target:
+        id: 2a68ac80-7331-4af6-85e2-fc612bf487d3
+    d412a4f4-441a-4a38-8941-9cfba88af0a5:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1490
+        'y': 630
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    f0fac0ad-ac7d-4d83-a856-ff9b5f72aeed:
+      source:
+        id: ea7b5728-5fbb-4198-af34-0260fba4afe6
+      target:
+        id: d412a4f4-441a-4a38-8941-9cfba88af0a5
+    e240f2ba-76fd-461e-be69-91f76dec57c2:
+      size:
+        width: 330
+        height: 240
+      position:
+        x: 470
+        'y': 30
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 9c089171-5560-442a-98cc-7dbd80e97a8c
+        - 04dddda5-c549-4085-8da6-c8b31c69b1e0
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    9c089171-5560-442a-98cc-7dbd80e97a8c:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 500
+        'y': 90
+      z: 3
+      parent: e240f2ba-76fd-461e-be69-91f76dec57c2
+      embeds: []
+      references:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+      dependson:
+        - e240f2ba-76fd-461e-be69-91f76dec57c2
+    2432aece-72dc-4f76-ab66-f76253766eff:
+      size:
+        width: 330
+        height: 240
+      position:
+        x: 470
+        'y': -270
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 79cddd27-045a-4ed2-8903-9bb813333ea9
+        - 4677076a-0de3-4fc2-a4a0-31f269381c9b
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    79cddd27-045a-4ed2-8903-9bb813333ea9:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 500
+        'y': -210
+      z: 3
+      parent: 2432aece-72dc-4f76-ab66-f76253766eff
+      embeds: []
+      references:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+      dependson:
+        - 2432aece-72dc-4f76-ab66-f76253766eff
+    a13b0c43-203c-4071-8248-cd553016ec26:
+      size:
+        width: 330
+        height: 240
+      position:
+        x: 80
+        'y': 30
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 3bdbb71d-847f-4dab-bed1-fae3a6aeccc3
+        - 935326e5-f9a1-48e9-abb1-e8f582548a31
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    3bdbb71d-847f-4dab-bed1-fae3a6aeccc3:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 110
+        'y': 90
+      z: 3
+      parent: a13b0c43-203c-4071-8248-cd553016ec26
+      embeds: []
+      references:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+      dependson:
+        - a13b0c43-203c-4071-8248-cd553016ec26
+    27f2dbba-c4c6-4ca7-bb1d-64a3fa28a6fc:
+      size:
+        width: 330
+        height: 240
+      position:
+        x: 80
+        'y': -270
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - c93cb037-57c9-485e-b505-8a21c96ab125
+        - 76e029d8-742d-41dc-85d4-03cc4483f35b
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    c93cb037-57c9-485e-b505-8a21c96ab125:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 110
+        'y': -210
+      z: 3
+      parent: 27f2dbba-c4c6-4ca7-bb1d-64a3fa28a6fc
+      embeds: []
+      references:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+      dependson:
+        - 27f2dbba-c4c6-4ca7-bb1d-64a3fa28a6fc
+    281f5058-560e-4522-9c1b-774532ff8dda:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1460
+        'y': -60
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    7f9a3041-5610-4f2b-9e3d-0303985682b0:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 1160
+        'y': -270
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 11c4f3fd-7904-4184-a610-1ac113bba2a1
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    dd75bead-f747-40bc-a88a-9e01419bd8bc:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 980
+        'y': 630
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 0668f04e-6189-4e94-b96a-4aa73fbd8fb0
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    290d4d9b-1a1a-4c85-8f71-f2af96a5262a:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 680
+        'y': 630
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 4d2b04ad-2e25-4d66-aa15-717e95a73a5f
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    51d7028d-6691-4ed9-aaa0-86d399eda59f:
+      source:
+        id: 579976df-4a9a-4e2b-9d6c-1a81865f0721
+      target:
+        id: 89ae6514-302b-419e-aeb8-37306520839e
+    ea4c1fa2-d000-498e-a646-151fa30ca2df:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 450
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 1e321b48-5a13-4122-8982-582d16308bd8
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+        - 87f50c88-a4cf-42b4-b43a-4febfad4e0ff
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 1e321b48-5a13-4122-8982-582d16308bd8
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+    425e2bae-22d6-43a6-a2c1-08b2f190d989:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 570
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - ea4c1fa2-d000-498e-a646-151fa30ca2df
+    a1097c86-ced6-448e-814b-f5d38b94332e:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 690
+      z: 1
+      embeds: []
+      isrelatedto:
+        - 425e2bae-22d6-43a6-a2c1-08b2f190d989
+        - ea4c1fa2-d000-498e-a646-151fa30ca2df
+    75b26f35-6fcb-4822-91e0-79cbb1614c5c:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 810
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - ea4c1fa2-d000-498e-a646-151fa30ca2df
+    e2c20949-c99b-4090-87a9-516dcca17b6e:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 930
+      z: 1
+      embeds: []
+      isrelatedto:
+        - 75b26f35-6fcb-4822-91e0-79cbb1614c5c
+        - ea4c1fa2-d000-498e-a646-151fa30ca2df
+    0652e097-9b55-4f5b-916c-d7246f5eadd6:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 1050
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 1e321b48-5a13-4122-8982-582d16308bd8
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - 87f50c88-a4cf-42b4-b43a-4febfad4e0ff
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 1e321b48-5a13-4122-8982-582d16308bd8
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+    1e486d5f-e263-4f72-9047-9b1bec40d678:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 1170
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 0652e097-9b55-4f5b-916c-d7246f5eadd6
+    156e9e37-6346-46cb-bce1-7307dae989be:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 1290
+      z: 1
+      embeds: []
+      isrelatedto:
+        - 1e486d5f-e263-4f72-9047-9b1bec40d678
+        - 0652e097-9b55-4f5b-916c-d7246f5eadd6
+    6a80488a-6730-4295-b662-95bb2d3eded7:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 1410
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - 0652e097-9b55-4f5b-916c-d7246f5eadd6
+    9caaf190-d525-4aed-8534-c82911df43e6:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 1530
+      z: 1
+      embeds: []
+      isrelatedto:
+        - 6a80488a-6730-4295-b662-95bb2d3eded7
+        - 0652e097-9b55-4f5b-916c-d7246f5eadd6
+    f89fb3e6-f896-49bf-a515-638f5e628313:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 1650
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+        - 5e7792f9-3460-48f6-8e57-a3092d3803d1
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 5e7792f9-3460-48f6-8e57-a3092d3803d1
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+    e0068c48-b7e1-4134-958e-9875ff9fcb96:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 1770
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - f89fb3e6-f896-49bf-a515-638f5e628313
+      dependson:
+        - 87f50c88-a4cf-42b4-b43a-4febfad4e0ff
+        - f89fb3e6-f896-49bf-a515-638f5e628313
+      isrelatedto:
+        - 87f50c88-a4cf-42b4-b43a-4febfad4e0ff
+    d5ee0013-9e48-42c8-9b8c-9d069942e4f1:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1890
+        'y': 1890
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - 5e7792f9-3460-48f6-8e57-a3092d3803d1
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 5e7792f9-3460-48f6-8e57-a3092d3803d1
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+    2662c8b9-5342-4232-bcf1-7b9d028ef38a:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 60
+        'y': 1920
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - d5ee0013-9e48-42c8-9b8c-9d069942e4f1
+      dependson:
+        - 87f50c88-a4cf-42b4-b43a-4febfad4e0ff
+        - d5ee0013-9e48-42c8-9b8c-9d069942e4f1
+      isrelatedto:
+        - 87f50c88-a4cf-42b4-b43a-4febfad4e0ff
+    404c75f8-d29b-477c-8b4a-94c6487bac72:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 180
+        'y': 1920
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+        - bd247bfa-1079-48e3-b591-21fd1743da77
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - bd247bfa-1079-48e3-b591-21fd1743da77
+    446892a6-6c82-462c-93d7-65546ef04369:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 300
+        'y': 1920
+      z: 1
+      embeds: []
+      isassociatedwith:
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - bd247bfa-1079-48e3-b591-21fd1743da77
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - bd247bfa-1079-48e3-b591-21fd1743da77
+    11c4f3fd-7904-4184-a610-1ac113bba2a1:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1190
+        'y': -210
+      z: 3
+      parent: 7f9a3041-5610-4f2b-9e3d-0303985682b0
+      embeds: []
+      references:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+      dependson:
+        - 7f9a3041-5610-4f2b-9e3d-0303985682b0
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+    0668f04e-6189-4e94-b96a-4aa73fbd8fb0:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1010
+        'y': 690
+      z: 3
+      parent: dd75bead-f747-40bc-a88a-9e01419bd8bc
+      embeds: []
+      references:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+      dependson:
+        - dd75bead-f747-40bc-a88a-9e01419bd8bc
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+    4d2b04ad-2e25-4d66-aa15-717e95a73a5f:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 710
+        'y': 690
+      z: 3
+      parent: 290d4d9b-1a1a-4c85-8f71-f2af96a5262a
+      embeds: []
+      references:
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+      dependson:
+        - 290d4d9b-1a1a-4c85-8f71-f2af96a5262a
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+    48a88552-008d-4bcd-a8c9-704eedc6d586:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1460
+        'y': -270
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    a4f32557-38b4-4ebb-9fb1-5286b6062d2d:
+      source:
+        id: e240f2ba-76fd-461e-be69-91f76dec57c2
+      target:
+        id: 48a88552-008d-4bcd-a8c9-704eedc6d586
+    f4d42b58-2ba0-4a0b-b5a9-449d4b99dbd1:
+      source:
+        id: e240f2ba-76fd-461e-be69-91f76dec57c2
+      target:
+        id: 48a88552-008d-4bcd-a8c9-704eedc6d586
+    ac8206e5-bbae-49b1-9220-625f5c6533ee:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 920
+        'y': 930
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    31fe1875-b6ee-4517-a4c9-e00f3e05d508:
+      source:
+        id: 2432aece-72dc-4f76-ab66-f76253766eff
+      target:
+        id: ac8206e5-bbae-49b1-9220-625f5c6533ee
+    e776890c-d40d-45c0-ad1c-0d324962d072:
+      source:
+        id: 2432aece-72dc-4f76-ab66-f76253766eff
+      target:
+        id: ac8206e5-bbae-49b1-9220-625f5c6533ee
+    57dff8ba-b55d-48c1-ab0c-f3bd3f82650f:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 710
+        'y': 930
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    42fe13e6-7801-4b23-91ec-aaf611f64c6d:
+      source:
+        id: a13b0c43-203c-4071-8248-cd553016ec26
+      target:
+        id: 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+    6149af8e-e8e1-4d0e-b908-a4fe453954be:
+      source:
+        id: a13b0c43-203c-4071-8248-cd553016ec26
+      target:
+        id: 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+    8deed1be-376e-4e2a-82a9-12c8d09a07cb:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 500
+        'y': 930
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    0dec2995-4670-4204-a5a5-ef6dea038aba:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 420
+        'y': 1920
+      z: 1
+      embeds: []
+      dependson:
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - ac8206e5-bbae-49b1-9220-625f5c6533ee
+        - 48a88552-008d-4bcd-a8c9-704eedc6d586
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+        - 10ffddce-64c0-442a-bd36-1ba4b904cfb7
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+        - e2ca73a4-ea76-4319-b429-690466d1ef04
+      isrelatedto:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - ac8206e5-bbae-49b1-9220-625f5c6533ee
+        - 48a88552-008d-4bcd-a8c9-704eedc6d586
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+        - 10ffddce-64c0-442a-bd36-1ba4b904cfb7
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+        - e2ca73a4-ea76-4319-b429-690466d1ef04
+    2729cbec-85c1-4e12-b469-76e84e439d78:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 540
+        'y': 1920
+      z: 1
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 27f2dbba-c4c6-4ca7-bb1d-64a3fa28a6fc
+        - a13b0c43-203c-4071-8248-cd553016ec26
+        - 2432aece-72dc-4f76-ab66-f76253766eff
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - ac8206e5-bbae-49b1-9220-625f5c6533ee
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+        - f89fb3e6-f896-49bf-a515-638f5e628313
+        - 404c75f8-d29b-477c-8b4a-94c6487bac72
+      isrelatedto:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - ac8206e5-bbae-49b1-9220-625f5c6533ee
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+    0cf4aa22-bc5f-4960-b60f-965bfce90d64:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 660
+        'y': 1920
+      z: 1
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 27f2dbba-c4c6-4ca7-bb1d-64a3fa28a6fc
+        - a13b0c43-203c-4071-8248-cd553016ec26
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - 446892a6-6c82-462c-93d7-65546ef04369
+        - d5ee0013-9e48-42c8-9b8c-9d069942e4f1
+      isrelatedto:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+    d3602533-36ff-4816-90ad-2112d715d810:
+      source:
+        id: 27f2dbba-c4c6-4ca7-bb1d-64a3fa28a6fc
+      target:
+        id: 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+    58c3f5eb-9c39-4461-b9b6-cd67399b8e8e:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 780
+        'y': 1920
+      z: 1
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+    fc2e93a7-0443-4f64-b659-6af299651d34:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 900
+        'y': 1920
+      z: 1
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+    873e7507-beec-4dfa-8686-5cd359ae61f8:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1020
+        'y': 1920
+      z: 1
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+    45ec648a-0dcf-4e1a-bc34-0ba76a810f1d:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1140
+        'y': 1920
+      z: 1
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+    5256dcaf-a85c-4669-9c23-fd566e610320:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 380
+        'y': 630
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 4e00f1d3-a324-473b-851e-97eb0bc3128c
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    f72e9622-a24d-4f5e-aefd-1432697b4f05:
+      source:
+        id: 281f5058-560e-4522-9c1b-774532ff8dda
+      target:
+        id: 5256dcaf-a85c-4669-9c23-fd566e610320
+    4e00f1d3-a324-473b-851e-97eb0bc3128c:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 410
+        'y': 690
+      z: 3
+      parent: 5256dcaf-a85c-4669-9c23-fd566e610320
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 58c3f5eb-9c39-4461-b9b6-cd67399b8e8e
+        - 5256dcaf-a85c-4669-9c23-fd566e610320
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+      isrelatedto:
+        - 58c3f5eb-9c39-4461-b9b6-cd67399b8e8e
+    04dddda5-c549-4085-8da6-c8b31c69b1e0:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 620
+        'y': 90
+      z: 3
+      parent: e240f2ba-76fd-461e-be69-91f76dec57c2
+      embeds: []
+      dependson:
+        - 4e00f1d3-a324-473b-851e-97eb0bc3128c
+      isrelatedto:
+        - 4e00f1d3-a324-473b-851e-97eb0bc3128c
+    2f8452b9-e59a-472e-aaf3-68ccacfe54d9:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 80
+        'y': 630
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 11504265-1d1d-4599-8bdd-116b52f82914
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    9340803e-1d45-44bc-9bbf-a5233685bc43:
+      source:
+        id: 7f9a3041-5610-4f2b-9e3d-0303985682b0
+      target:
+        id: 2f8452b9-e59a-472e-aaf3-68ccacfe54d9
+    11504265-1d1d-4599-8bdd-116b52f82914:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 110
+        'y': 690
+      z: 3
+      parent: 2f8452b9-e59a-472e-aaf3-68ccacfe54d9
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - fc2e93a7-0443-4f64-b659-6af299651d34
+        - 2f8452b9-e59a-472e-aaf3-68ccacfe54d9
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+      isrelatedto:
+        - fc2e93a7-0443-4f64-b659-6af299651d34
+    4677076a-0de3-4fc2-a4a0-31f269381c9b:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 620
+        'y': -210
+      z: 3
+      parent: 2432aece-72dc-4f76-ab66-f76253766eff
+      embeds: []
+      dependson:
+        - 11504265-1d1d-4599-8bdd-116b52f82914
+      isrelatedto:
+        - 11504265-1d1d-4599-8bdd-116b52f82914
+    4be73a31-4ece-402c-a762-ebc1c4a95db0:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 980
+        'y': 330
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - a4156b42-47d9-4820-8243-1d5990147914
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    dde20ed4-da14-476a-b366-32c47fe32188:
+      source:
+        id: dd75bead-f747-40bc-a88a-9e01419bd8bc
+      target:
+        id: 4be73a31-4ece-402c-a762-ebc1c4a95db0
+    a4156b42-47d9-4820-8243-1d5990147914:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1010
+        'y': 390
+      z: 3
+      parent: 4be73a31-4ece-402c-a762-ebc1c4a95db0
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 873e7507-beec-4dfa-8686-5cd359ae61f8
+        - 4be73a31-4ece-402c-a762-ebc1c4a95db0
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+      isrelatedto:
+        - 873e7507-beec-4dfa-8686-5cd359ae61f8
+    935326e5-f9a1-48e9-abb1-e8f582548a31:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 230
+        'y': 90
+      z: 3
+      parent: a13b0c43-203c-4071-8248-cd553016ec26
+      embeds: []
+      dependson:
+        - a4156b42-47d9-4820-8243-1d5990147914
+      isrelatedto:
+        - a4156b42-47d9-4820-8243-1d5990147914
+    201e86af-a966-4e80-85ad-281e4ebd3723:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 860
+        'y': 30
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - badaad41-48e6-499a-922f-9c85d84b50b2
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    e93888ce-6134-4419-8da4-b82c3716110d:
+      source:
+        id: 290d4d9b-1a1a-4c85-8f71-f2af96a5262a
+      target:
+        id: 201e86af-a966-4e80-85ad-281e4ebd3723
+    badaad41-48e6-499a-922f-9c85d84b50b2:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 880
+        'y': 90
+      z: 3
+      parent: 201e86af-a966-4e80-85ad-281e4ebd3723
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 45ec648a-0dcf-4e1a-bc34-0ba76a810f1d
+        - 201e86af-a966-4e80-85ad-281e4ebd3723
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+      isrelatedto:
+        - 45ec648a-0dcf-4e1a-bc34-0ba76a810f1d
+    76e029d8-742d-41dc-85d4-03cc4483f35b:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 230
+        'y': -210
+      z: 3
+      parent: 27f2dbba-c4c6-4ca7-bb1d-64a3fa28a6fc
+      embeds: []
+      dependson:
+        - badaad41-48e6-499a-922f-9c85d84b50b2
+      isrelatedto:
+        - badaad41-48e6-499a-922f-9c85d84b50b2
+    c8814fa5-778c-4af1-884f-5764095ed856:
+      source:
+        id: 27f2dbba-c4c6-4ca7-bb1d-64a3fa28a6fc
+      target:
+        id: 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+    bfde668d-28f2-4927-bfe6-f124ba827bd7:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 860
+        'y': -270
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - 1f7b7771-ca89-4a72-96e0-1bef31c468a5
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    1f7b7771-ca89-4a72-96e0-1bef31c468a5:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 890
+        'y': -210
+      z: 3
+      parent: bfde668d-28f2-4927-bfe6-f124ba827bd7
+      embeds: []
+      dependson:
+        - 4e00f1d3-a324-473b-851e-97eb0bc3128c
+      isrelatedto:
+        - 4e00f1d3-a324-473b-851e-97eb0bc3128c
+    6705e751-a57c-4bb0-b619-613802d91a16:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 680
+        'y': 330
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - fc8447ce-71f8-42ed-9fa9-e85efc775aac
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    fc8447ce-71f8-42ed-9fa9-e85efc775aac:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 710
+        'y': 390
+      z: 3
+      parent: 6705e751-a57c-4bb0-b619-613802d91a16
+      embeds: []
+      dependson:
+        - 11504265-1d1d-4599-8bdd-116b52f82914
+      isrelatedto:
+        - 11504265-1d1d-4599-8bdd-116b52f82914
+    afdabb17-af10-4c11-a8aa-2667cdf87ce6:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 380
+        'y': 330
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - a1641b26-aa8b-403f-8f7e-ee755990b535
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    a1641b26-aa8b-403f-8f7e-ee755990b535:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 410
+        'y': 390
+      z: 3
+      parent: afdabb17-af10-4c11-a8aa-2667cdf87ce6
+      embeds: []
+      dependson:
+        - a4156b42-47d9-4820-8243-1d5990147914
+      isrelatedto:
+        - a4156b42-47d9-4820-8243-1d5990147914
+    6e83f5bd-4c6b-4e5f-b663-1db85f87e207:
+      size:
+        width: 240
+        height: 240
+      position:
+        x: 80
+        'y': 330
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds:
+        - ced63427-bc6c-4a81-8ccc-ff15bbbafe87
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    ced63427-bc6c-4a81-8ccc-ff15bbbafe87:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 110
+        'y': 390
+      z: 3
+      parent: 6e83f5bd-4c6b-4e5f-b663-1db85f87e207
+      embeds: []
+      dependson:
+        - badaad41-48e6-499a-922f-9c85d84b50b2
+      isrelatedto:
+        - badaad41-48e6-499a-922f-9c85d84b50b2
+    63cace10-74a0-4e19-bff1-62306a6a9a9f:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 290
+        'y': 930
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    efbf2d4c-e930-407e-8946-4250ff627d13:
+      source:
+        id: bfde668d-28f2-4927-bfe6-f124ba827bd7
+      target:
+        id: 63cace10-74a0-4e19-bff1-62306a6a9a9f
+    43a4ef37-ff51-43a4-886c-a95d6718aa05:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 80
+        'y': 930
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    0d2818f8-13cd-40cd-808d-a1024db403c7:
+      source:
+        id: 6705e751-a57c-4bb0-b619-613802d91a16
+      target:
+        id: 43a4ef37-ff51-43a4-886c-a95d6718aa05
+    30929453-52e7-4bcd-912f-6b161585b551:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1280
+        'y': 840
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    2f21788f-2a81-43b5-948a-256b5ed434e1:
+      source:
+        id: afdabb17-af10-4c11-a8aa-2667cdf87ce6
+      target:
+        id: 30929453-52e7-4bcd-912f-6b161585b551
+    4246edda-7b78-4c75-bcb7-a310e227539e:
+      size:
+        width: 150
+        height: 150
+      position:
+        x: 1280
+        'y': 630
+      z: 2
+      parent: 89ae6514-302b-419e-aeb8-37306520839e
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+    bb241c1f-261f-4abc-96bd-cbececb5f6ae:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1260
+        'y': 1920
+      z: 1
+      embeds: []
+      dependson:
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - ac8206e5-bbae-49b1-9220-625f5c6533ee
+        - 48a88552-008d-4bcd-a8c9-704eedc6d586
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+        - 10ffddce-64c0-442a-bd36-1ba4b904cfb7
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+        - e2ca73a4-ea76-4319-b429-690466d1ef04
+      isrelatedto:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - ac8206e5-bbae-49b1-9220-625f5c6533ee
+        - 48a88552-008d-4bcd-a8c9-704eedc6d586
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+        - 10ffddce-64c0-442a-bd36-1ba4b904cfb7
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+        - e2ca73a4-ea76-4319-b429-690466d1ef04
+        - 201e86af-a966-4e80-85ad-281e4ebd3723
+        - 4be73a31-4ece-402c-a762-ebc1c4a95db0
+        - 2f8452b9-e59a-472e-aaf3-68ccacfe54d9
+        - 5256dcaf-a85c-4669-9c23-fd566e610320
+        - 4246edda-7b78-4c75-bcb7-a310e227539e
+        - 30929453-52e7-4bcd-912f-6b161585b551
+        - 43a4ef37-ff51-43a4-886c-a95d6718aa05
+        - 63cace10-74a0-4e19-bff1-62306a6a9a9f
+    960bfc44-b63c-4c97-87c7-1107301beefb:
+      source:
+        id: 6e83f5bd-4c6b-4e5f-b663-1db85f87e207
+      target:
+        id: 4246edda-7b78-4c75-bcb7-a310e227539e
+    62388257-7e92-4b1d-8312-ee79a172ffa2:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1380
+        'y': 1920
+      z: 1
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 6e83f5bd-4c6b-4e5f-b663-1db85f87e207
+        - afdabb17-af10-4c11-a8aa-2667cdf87ce6
+        - 6705e751-a57c-4bb0-b619-613802d91a16
+        - ced63427-bc6c-4a81-8ccc-ff15bbbafe87
+        - a1641b26-aa8b-403f-8f7e-ee755990b535
+        - fc8447ce-71f8-42ed-9fa9-e85efc775aac
+        - 4d2b04ad-2e25-4d66-aa15-717e95a73a5f
+        - 0668f04e-6189-4e94-b96a-4aa73fbd8fb0
+        - 11c4f3fd-7904-4184-a610-1ac113bba2a1
+        - e93888ce-6134-4419-8da4-b82c3716110d
+        - dde20ed4-da14-476a-b366-32c47fe32188
+        - 9340803e-1d45-44bc-9bbf-a5233685bc43
+        - 4246edda-7b78-4c75-bcb7-a310e227539e
+        - 30929453-52e7-4bcd-912f-6b161585b551
+        - badaad41-48e6-499a-922f-9c85d84b50b2
+        - a4156b42-47d9-4820-8243-1d5990147914
+        - 11504265-1d1d-4599-8bdd-116b52f82914
+        - 960bfc44-b63c-4c97-87c7-1107301beefb
+        - 2f21788f-2a81-43b5-948a-256b5ed434e1
+        - 0d2818f8-13cd-40cd-808d-a1024db403c7
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - ac8206e5-bbae-49b1-9220-625f5c6533ee
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+        - f89fb3e6-f896-49bf-a515-638f5e628313
+        - 404c75f8-d29b-477c-8b4a-94c6487bac72
+      isrelatedto:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - ac8206e5-bbae-49b1-9220-625f5c6533ee
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - e352ebb8-bb2c-40e5-b77a-99274eb4990f
+        - 201e86af-a966-4e80-85ad-281e4ebd3723
+        - 4be73a31-4ece-402c-a762-ebc1c4a95db0
+        - 2f8452b9-e59a-472e-aaf3-68ccacfe54d9
+        - 4246edda-7b78-4c75-bcb7-a310e227539e
+        - 30929453-52e7-4bcd-912f-6b161585b551
+        - 43a4ef37-ff51-43a4-886c-a95d6718aa05
+    e725b7e2-25b4-4d42-b890-dd7c7aeafea8:
+      size:
+        width: 60
+        height: 60
+      position:
+        x: 1500
+        'y': 1920
+      z: 1
+      embeds: []
+      dependson:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - ced63427-bc6c-4a81-8ccc-ff15bbbafe87
+        - a1641b26-aa8b-403f-8f7e-ee755990b535
+        - 6e83f5bd-4c6b-4e5f-b663-1db85f87e207
+        - afdabb17-af10-4c11-a8aa-2667cdf87ce6
+        - 4d2b04ad-2e25-4d66-aa15-717e95a73a5f
+        - 0668f04e-6189-4e94-b96a-4aa73fbd8fb0
+        - e93888ce-6134-4419-8da4-b82c3716110d
+        - dde20ed4-da14-476a-b366-32c47fe32188
+        - 4246edda-7b78-4c75-bcb7-a310e227539e
+        - 30929453-52e7-4bcd-912f-6b161585b551
+        - badaad41-48e6-499a-922f-9c85d84b50b2
+        - a4156b42-47d9-4820-8243-1d5990147914
+        - 960bfc44-b63c-4c97-87c7-1107301beefb
+        - 2f21788f-2a81-43b5-948a-256b5ed434e1
+        - 51d7028d-6691-4ed9-aaa0-86d399eda59f
+        - 579976df-4a9a-4e2b-9d6c-1a81865f0721
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - 446892a6-6c82-462c-93d7-65546ef04369
+        - d5ee0013-9e48-42c8-9b8c-9d069942e4f1
+      isrelatedto:
+        - 89ae6514-302b-419e-aeb8-37306520839e
+        - 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+        - 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+        - d412a4f4-441a-4a38-8941-9cfba88af0a5
+        - 2a68ac80-7331-4af6-85e2-fc612bf487d3
+        - e72075c6-799e-4adc-a10f-5c9121777974
+        - 960e6c66-b286-4bc0-97cb-b8781f49aff8
+        - 201e86af-a966-4e80-85ad-281e4ebd3723
+        - 4be73a31-4ece-402c-a762-ebc1c4a95db0
+        - 4246edda-7b78-4c75-bcb7-a310e227539e
+        - 30929453-52e7-4bcd-912f-6b161585b551
+Mappings:
+  Constants:
+    S3URL:
+      URL1: 'https://s3.amazonaws.com'
+    S3MainTpl:
+      TPL1: firewall.template
+  AWSInstanceType2Arch:
+    t1.micro:
+      Arch: PV64
+    t2.micro:
+      Arch: HVM64
+    t2.small:
+      Arch: HVM64
+    t2.medium:
+      Arch: HVM64
+    m1.small:
+      Arch: PV64
+    m1.medium:
+      Arch: PV64
+    m1.large:
+      Arch: PV64
+    m1.xlarge:
+      Arch: PV64
+    m2.xlarge:
+      Arch: PV64
+    m2.2xlarge:
+      Arch: PV64
+    m2.4xlarge:
+      Arch: PV64
+    m3.medium:
+      Arch: HVM64
+    m3.large:
+      Arch: HVM64
+    m3.xlarge:
+      Arch: HVM64
+    m3.2xlarge:
+      Arch: HVM64
+    c1.medium:
+      Arch: PV64
+    c1.xlarge:
+      Arch: PV64
+    c3.large:
+      Arch: HVM64
+    c3.xlarge:
+      Arch: HVM64
+    c3.2xlarge:
+      Arch: HVM64
+    c3.4xlarge:
+      Arch: HVM64
+    c3.8xlarge:
+      Arch: HVM64
+    c4.large:
+      Arch: HVM64
+    c4.xlarge:
+      Arch: HVM64
+    c4.2xlarge:
+      Arch: HVM64
+    c4.4xlarge:
+      Arch: HVM64
+    c4.8xlarge:
+      Arch: HVM64
+    g2.2xlarge:
+      Arch: HVMG2
+    r3.large:
+      Arch: HVM64
+    r3.xlarge:
+      Arch: HVM64
+    r3.2xlarge:
+      Arch: HVM64
+    r3.4xlarge:
+      Arch: HVM64
+    r3.8xlarge:
+      Arch: HVM64
+    i2.xlarge:
+      Arch: HVM64
+    i2.2xlarge:
+      Arch: HVM64
+    i2.4xlarge:
+      Arch: HVM64
+    i2.8xlarge:
+      Arch: HVM64
+    d2.xlarge:
+      Arch: HVM64
+    d2.2xlarge:
+      Arch: HVM64
+    d2.4xlarge:
+      Arch: HVM64
+    d2.8xlarge:
+      Arch: HVM64
+    hi1.4xlarge:
+      Arch: HVM64
+    hs1.8xlarge:
+      Arch: HVM64
+    cr1.8xlarge:
+      Arch: HVM64
+    cc2.8xlarge:
+      Arch: HVM64
+  AWSRegionArch2AMI:
+    us-east-1:
+      PV64: ami-1ccae774
+      HVM64: ami-1ecae776
+      HVMG2: ami-8c6b40e4
+    us-east-2:
+      PV64: NOT_SUPPORTED
+      HVM64: ami-c55673a0
+      HVMG2: NOT_SUPPORTED
+    us-west-2:
+      PV64: ami-ff527ecf
+      HVM64: ami-e7527ed7
+      HVMG2: ami-abbe919b
+    us-west-1:
+      PV64: ami-d514f291
+      HVM64: ami-d114f295
+      HVMG2: ami-f31ffeb7
+    eu-west-1:
+      PV64: ami-bf0897c8
+      HVM64: ami-a10897d6
+      HVMG2: ami-d5bc24a2
+    eu-central-1:
+      PV64: ami-ac221fb1
+      HVM64: ami-a8221fb5
+      HVMG2: ami-7cd2ef61
+    ap-northeast-1:
+      PV64: ami-27f90e27
+      HVM64: ami-cbf90ecb
+      HVMG2: ami-6318e863
+    ap-southeast-1:
+      PV64: ami-acd9e8fe
+      HVM64: ami-68d8e93a
+      HVMG2: ami-3807376a
+    ap-southeast-2:
+      PV64: ami-ff9cecc5
+      HVM64: ami-fd9cecc7
+      HVMG2: ami-89790ab3
+    sa-east-1:
+      PV64: ami-bb2890a6
+      HVM64: ami-b52890a8
+      HVMG2: NOT_SUPPORTED
+    cn-north-1:
+      PV64: ami-fa39abc3
+      HVM64: ami-f239abcb
+      HVMG2: NOT_SUPPORTED
+  BucketRegionMap:
+    us-west-2:
+      Name: panw-aws-us-west-2
+    us-west-1:
+      Name: panw-aws-us-west-1
+    us-east-1:
+      Name: panw-aws-us-east-1
+    us-east-2:
+      Name: panw-aws-us-east-2
+    eu-west-1:
+      Name: panw-aws-eu-west-1
+    eu-central-1:
+      Name: panw-aws-eu-central-1
+    ap-northeast-1:
+      Name: panw-aws-ap-northeast-1
+    ap-northeast-2:
+      Name: panw-aws-ap-northeast-2
+    ap-southeast-1:
+      Name: panw-aws-ap-southeast-1
+    ap-southeast-2:
+      Name: panw-aws-ap-southeast-2
+    sa-east-1:
+      Name: panw-aws-sa-east-1
+  VersionMap:
+    Version:
+      Key: v1.2
+Conditions:
+  CreateSubnet2: !Equals 
+    - !Ref NumberOfAZs
+    - '2'
+  CreateSubnetAz3: !Equals 
+    - !Ref NumberOfAZs
+    - '3'
+  CreateSubnet3: !Or 
+    - !Equals 
+      - !Ref NumberOfAZs
+      - '3'
+    - !Equals 
+      - !Ref NumberOfAZs
+      - '4'
+  CreateSubnet4: !Equals 
+    - !Ref NumberOfAZs
+    - '4'
+  NATGatewayRequired: !Equals 
+    - !Ref NATGateway
+    - 'Yes'
+  NATGatewayRequired2: !And 
+    - !Equals 
+      - !Ref NATGateway
+      - 'Yes'
+    - !Condition CreateSubnet2
+  NATGatewayRequired3: !And 
+    - !Equals 
+      - !Ref NATGateway
+      - 'Yes'
+    - !Condition CreateSubnet3
+  NATGatewayRequired4: !And 
+    - !Equals 
+      - !Ref NATGateway
+      - 'Yes'
+    - !Condition CreateSubnet4
+  NATGatewayNotRequired: !Equals 
+    - !Ref NATGateway
+    - 'No'
+  NATGatewayNotRequired2: !And 
+    - !Equals 
+      - !Ref NATGateway
+      - 'No'
+    - !Condition CreateSubnet2
+  NATGatewayNotRequired3: !And 
+    - !Equals 
+      - !Ref NATGateway
+      - 'No'
+    - !Condition CreateSubnet3
+  NATGatewayNotRequired4: !And 
+    - !Equals 
+      - !Ref NATGateway
+      - 'No'
+    - !Condition CreateSubnet4
+  PANWCode: !Equals 
+    - !Join 
+      - '-'
+      - - !Ref PanS3BucketTpl
+        - !Ref 'AWS::Region'
+    - !FindInMap 
+      - BucketRegionMap
+      - !Ref 'AWS::Region'
+      - Name
+Resources:
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: MGMT
+        - Key: Name
+          Value: !Ref VPCName
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 89ae6514-302b-419e-aeb8-37306520839e
+  LambdaSubnetAz1:
+    Type: 'AWS::EC2::Subnet'
+    Condition: NATGatewayRequired
+    Properties:
+      AvailabilityZone: !Select 
+        - '0'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '0'
+        - !Ref LambdaSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: LambdaFunction
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - LambdaSubnetAz1
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 4246edda-7b78-4c75-bcb7-a310e227539e
+  LambdaSubnetAz2:
+    Type: 'AWS::EC2::Subnet'
+    Condition: NATGatewayRequired
+    Properties:
+      AvailabilityZone: !Select 
+        - '1'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '1'
+        - !Ref LambdaSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: LambdaFunction
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - LambdaSubnetAz2
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 30929453-52e7-4bcd-912f-6b161585b551
+  LambdaSubnetAz3:
+    Type: 'AWS::EC2::Subnet'
+    Condition: NATGatewayRequired3
+    Properties:
+      AvailabilityZone: !Select 
+        - '2'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '2'
+        - !Ref LambdaSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: LambdaFunction
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - LambdaSubnetAz3
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 43a4ef37-ff51-43a4-886c-a95d6718aa05
+  LambdaSubnetAz4:
+    Type: 'AWS::EC2::Subnet'
+    Condition: NATGatewayRequired4
+    Properties:
+      AvailabilityZone: !Select 
+        - '3'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '3'
+        - !Ref LambdaSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: LambdaFunction
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - LambdaSubnetAz4
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 63cace10-74a0-4e19-bff1-62306a6a9a9f
+  LambdaRouteTableAz1:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: NATGatewayRequired
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - LambdaRouteTableAz1
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 6e83f5bd-4c6b-4e5f-b663-1db85f87e207
+  LambdaRouteTableAz2:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: NATGatewayRequired
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - LambdaRouteTableAz2
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: afdabb17-af10-4c11-a8aa-2667cdf87ce6
+  LambdaRouteTableAz3:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: NATGatewayRequired3
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - LambdaRouteTableAz3
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 6705e751-a57c-4bb0-b619-613802d91a16
+  LambdaRouteTableAz4:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: NATGatewayRequired4
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - LambdaRouteTableAz4
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: bfde668d-28f2-4927-bfe6-f124ba827bd7
+  NATGWSubnetAz1:
+    Type: 'AWS::EC2::Subnet'
+    Condition: NATGatewayRequired
+    Properties:
+      AvailabilityZone: !Select 
+        - '0'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '0'
+        - !Ref NATGWSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: NATGW
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - NATGWSubnetAz1
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 201e86af-a966-4e80-85ad-281e4ebd3723
+  NATGWSubnetAz2:
+    Type: 'AWS::EC2::Subnet'
+    Condition: NATGatewayRequired
+    Properties:
+      AvailabilityZone: !Select 
+        - '1'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '1'
+        - !Ref NATGWSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: NATGW
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - NATGWSubnetAz2
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 4be73a31-4ece-402c-a762-ebc1c4a95db0
+  NATGWSubnetAz3:
+    Type: 'AWS::EC2::Subnet'
+    Condition: NATGatewayRequired3
+    Properties:
+      AvailabilityZone: !Select 
+        - '2'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '2'
+        - !Ref NATGWSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: NATGW
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - NATGWSubnetAz3
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 2f8452b9-e59a-472e-aaf3-68ccacfe54d9
+  NATGWSubnetAz4:
+    Type: 'AWS::EC2::Subnet'
+    Condition: NATGatewayRequired4
+    Properties:
+      AvailabilityZone: !Select 
+        - '3'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '3'
+        - !Ref NATGWSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: NATGW
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - NATGWSubnetAz4
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 5256dcaf-a85c-4669-9c23-fd566e610320
+  EIP1:
+    Type: 'AWS::EC2::EIP'
+    Condition: NATGatewayRequired
+    Properties:
+      Domain: VPC
+    DependsOn:
+      - VPC
+      - GatewayToInternet
+      - InternetGateway
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 45ec648a-0dcf-4e1a-bc34-0ba76a810f1d
+  EIP2:
+    Type: 'AWS::EC2::EIP'
+    Condition: NATGatewayRequired
+    Properties:
+      Domain: VPC
+    DependsOn:
+      - VPC
+      - GatewayToInternet
+      - InternetGateway
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 873e7507-beec-4dfa-8686-5cd359ae61f8
+  EIP3:
+    Type: 'AWS::EC2::EIP'
+    Condition: NATGatewayRequired3
+    Properties:
+      Domain: VPC
+    DependsOn:
+      - VPC
+      - GatewayToInternet
+      - InternetGateway
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: fc2e93a7-0443-4f64-b659-6af299651d34
+  EIP4:
+    Type: 'AWS::EC2::EIP'
+    Condition: NATGatewayRequired4
+    Properties:
+      Domain: VPC
+    DependsOn:
+      - VPC
+      - GatewayToInternet
+      - InternetGateway
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 58c3f5eb-9c39-4461-b9b6-cd67399b8e8e
+  NAT1:
+    Type: 'AWS::EC2::NatGateway'
+    Condition: NATGatewayRequired
+    Properties:
+      AllocationId: !GetAtt 
+        - EIP1
+        - AllocationId
+      SubnetId: !Ref NATGWSubnetAz1
+    DependsOn:
+      - VPC
+      - EIP1
+      - NATGWSubnetAz1
+      - GatewayToInternet
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: badaad41-48e6-499a-922f-9c85d84b50b2
+  NAT2:
+    Type: 'AWS::EC2::NatGateway'
+    Condition: NATGatewayRequired
+    Properties:
+      AllocationId: !GetAtt 
+        - EIP2
+        - AllocationId
+      SubnetId: !Ref NATGWSubnetAz2
+    DependsOn:
+      - VPC
+      - EIP2
+      - NATGWSubnetAz2
+      - GatewayToInternet
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: a4156b42-47d9-4820-8243-1d5990147914
+  NAT3:
+    Type: 'AWS::EC2::NatGateway'
+    Condition: NATGatewayRequired3
+    Properties:
+      AllocationId: !GetAtt 
+        - EIP3
+        - AllocationId
+      SubnetId: !Ref NATGWSubnetAz3
+    DependsOn:
+      - VPC
+      - EIP3
+      - NATGWSubnetAz3
+      - GatewayToInternet
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 11504265-1d1d-4599-8bdd-116b52f82914
+  NAT4:
+    Type: 'AWS::EC2::NatGateway'
+    Condition: NATGatewayRequired4
+    Properties:
+      AllocationId: !GetAtt 
+        - EIP4
+        - AllocationId
+      SubnetId: !Ref NATGWSubnetAz4
+    DependsOn:
+      - VPC
+      - EIP4
+      - NATGWSubnetAz4
+      - GatewayToInternet
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 4e00f1d3-a324-473b-851e-97eb0bc3128c
+  MGMTSubnetAz1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select 
+        - '0'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '0'
+        - !Ref MgmtSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: MGMT
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - MGMTSubnetAz1
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 8deed1be-376e-4e2a-82a9-12c8d09a07cb
+  MGMTSubnetAz2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select 
+        - '1'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '1'
+        - !Ref MgmtSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: MGMT
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - MGMTSubnetAz2
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 57dff8ba-b55d-48c1-ab0c-f3bd3f82650f
+  MGMTSubnetAz3:
+    Type: 'AWS::EC2::Subnet'
+    Condition: CreateSubnet3
+    Properties:
+      AvailabilityZone: !Select 
+        - '2'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '2'
+        - !Ref MgmtSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: MGMT
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - MGMTSubnetAz3
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: ac8206e5-bbae-49b1-9220-625f5c6533ee
+  MGMTSubnetAz4:
+    Type: 'AWS::EC2::Subnet'
+    Condition: CreateSubnet4
+    Properties:
+      AvailabilityZone: !Select 
+        - '3'
+        - !Ref VpcAzs
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '3'
+        - !Ref MgmtSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: MGMT
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - MGMTSubnetAz4
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 48a88552-008d-4bcd-a8c9-704eedc6d586
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: MGMT
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - InternetGateway
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 579976df-4a9a-4e2b-9d6c-1a81865f0721
+  GatewayToInternet:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+    DependsOn:
+      - InternetGateway
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 51d7028d-6691-4ed9-aaa0-86d399eda59f
+  NATGWRouteTableAz1:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: NATGatewayRequired
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - NATGWRouteTableAz1
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 290d4d9b-1a1a-4c85-8f71-f2af96a5262a
+  NATGWRouteTableAz2:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: NATGatewayRequired
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - NATGWRouteTableAz2
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: dd75bead-f747-40bc-a88a-9e01419bd8bc
+  NATGWRouteTableAz3:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: NATGatewayRequired3
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - NATGWRouteTableAz3
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 7f9a3041-5610-4f2b-9e3d-0303985682b0
+  NATGWRouteTableAz4:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: NATGatewayRequired4
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - NATGWRouteTableAz4
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 281f5058-560e-4522-9c1b-774532ff8dda
+  NATGWRoute1:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired
+    Properties:
+      RouteTableId: !Ref NATGWRouteTableAz1
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn:
+      - NATGWRouteTableAz1
+      - GatewayToInternet
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 4d2b04ad-2e25-4d66-aa15-717e95a73a5f
+  NATGWRoute2:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired
+    Properties:
+      RouteTableId: !Ref NATGWRouteTableAz2
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn:
+      - NATGWRouteTableAz2
+      - GatewayToInternet
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 0668f04e-6189-4e94-b96a-4aa73fbd8fb0
+  NATGWRoute3:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired3
+    Properties:
+      RouteTableId: !Ref NATGWRouteTableAz3
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn:
+      - NATGWRouteTableAz3
+      - GatewayToInternet
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 11c4f3fd-7904-4184-a610-1ac113bba2a1
+  MGMTRouteTableAz1:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - MGMTRouteTableAz1
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 27f2dbba-c4c6-4ca7-bb1d-64a3fa28a6fc
+  MGMTRouteTableAz2:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - MGMTRouteTableAz2
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: a13b0c43-203c-4071-8248-cd553016ec26
+  MGMTRouteTableAz3:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: CreateSubnet3
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - MGMTRouteTableAz3
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 2432aece-72dc-4f76-ab66-f76253766eff
+  MGMTRouteTableAz4:
+    Type: 'AWS::EC2::RouteTable'
+    Condition: CreateSubnet4
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - MGMTRouteTableAz4
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e240f2ba-76fd-461e-be69-91f76dec57c2
+  MGMTRoute1:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayNotRequired
+    Properties:
+      RouteTableId: !Ref MGMTRouteTableAz1
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn:
+      - MGMTRouteTableAz1
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: c93cb037-57c9-485e-b505-8a21c96ab125
+  MGMTRoute2:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayNotRequired
+    Properties:
+      RouteTableId: !Ref MGMTRouteTableAz2
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn:
+      - MGMTRouteTableAz2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 3bdbb71d-847f-4dab-bed1-fae3a6aeccc3
+  MGMTRoute3:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayNotRequired3
+    Properties:
+      RouteTableId: !Ref MGMTRouteTableAz3
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn:
+      - MGMTRouteTableAz3
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 79cddd27-045a-4ed2-8903-9bb813333ea9
+  MGMTRoute4:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayNotRequired4
+    Properties:
+      RouteTableId: !Ref MGMTRouteTableAz4
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn:
+      - MGMTRouteTableAz4
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 9c089171-5560-442a-98cc-7dbd80e97a8c
+  LambdaRoute1:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired
+    Properties:
+      RouteTableId: !Ref LambdaRouteTableAz1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NAT1
+    DependsOn:
+      - NAT1
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: ced63427-bc6c-4a81-8ccc-ff15bbbafe87
+  LambdaRoute2:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired
+    Properties:
+      RouteTableId: !Ref LambdaRouteTableAz2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NAT2
+    DependsOn:
+      - NAT2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: a1641b26-aa8b-403f-8f7e-ee755990b535
+  LambdaRoute3:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired3
+    Properties:
+      RouteTableId: !Ref LambdaRouteTableAz3
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NAT3
+    DependsOn:
+      - NAT3
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: fc8447ce-71f8-42ed-9fa9-e85efc775aac
+  LambdaRoute4:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired4
+    Properties:
+      RouteTableId: !Ref LambdaRouteTableAz4
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NAT4
+    DependsOn:
+      - NAT4
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 1f7b7771-ca89-4a72-96e0-1bef31c468a5
+  MGMTRouteNAT1:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired
+    Properties:
+      RouteTableId: !Ref MGMTRouteTableAz1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NAT1
+    DependsOn:
+      - NAT1
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 76e029d8-742d-41dc-85d4-03cc4483f35b
+  MGMTRouteNAT2:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired
+    Properties:
+      RouteTableId: !Ref MGMTRouteTableAz2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NAT2
+    DependsOn:
+      - NAT2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 935326e5-f9a1-48e9-abb1-e8f582548a31
+  MGMTRouteNAT3:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired3
+    Properties:
+      RouteTableId: !Ref MGMTRouteTableAz3
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NAT3
+    DependsOn:
+      - NAT3
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 4677076a-0de3-4fc2-a4a0-31f269381c9b
+  MGMTRouteNAT4:
+    Type: 'AWS::EC2::Route'
+    Condition: NATGatewayRequired4
+    Properties:
+      RouteTableId: !Ref MGMTRouteTableAz4
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NAT4
+    DependsOn:
+      - NAT4
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 04dddda5-c549-4085-8da6-c8b31c69b1e0
+  LambdaSubnetRouteTableAssociation1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired
+    Properties:
+      SubnetId: !Ref LambdaSubnetAz1
+      RouteTableId: !Ref LambdaRouteTableAz1
+    DependsOn:
+      - LambdaRouteTableAz1
+      - LambdaSubnetAz1
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 960bfc44-b63c-4c97-87c7-1107301beefb
+  LambdaSubnetRouteTableAssociation2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired
+    Properties:
+      SubnetId: !Ref LambdaSubnetAz2
+      RouteTableId: !Ref LambdaRouteTableAz2
+    DependsOn:
+      - LambdaRouteTableAz2
+      - LambdaSubnetAz2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 2f21788f-2a81-43b5-948a-256b5ed434e1
+  LambdaSubnetRouteTableAssociation3:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired3
+    Properties:
+      SubnetId: !Ref LambdaSubnetAz3
+      RouteTableId: !Ref LambdaRouteTableAz3
+    DependsOn:
+      - LambdaRouteTableAz3
+      - LambdaSubnetAz3
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 0d2818f8-13cd-40cd-808d-a1024db403c7
+  LambdaSubnetRouteTableAssociation4:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired4
+    Properties:
+      SubnetId: !Ref LambdaSubnetAz4
+      RouteTableId: !Ref LambdaRouteTableAz4
+    DependsOn:
+      - LambdaRouteTableAz4
+      - LambdaSubnetAz4
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: efbf2d4c-e930-407e-8946-4250ff627d13
+  MGMTSubnetRouteTableAssociation1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayNotRequired
+    Properties:
+      SubnetId: !Ref MGMTSubnetAz1
+      RouteTableId: !Ref MGMTRouteTableAz1
+    DependsOn:
+      - MGMTSubnetAz1
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: d3602533-36ff-4816-90ad-2112d715d810
+  MGMTSubnetRouteTableAssociation2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayNotRequired
+    Properties:
+      SubnetId: !Ref MGMTSubnetAz2
+      RouteTableId: !Ref MGMTRouteTableAz2
+    DependsOn:
+      - MGMTSubnetAz2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 6149af8e-e8e1-4d0e-b908-a4fe453954be
+  MGMTSubnetRouteTableAssociation3:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayNotRequired3
+    Properties:
+      SubnetId: !Ref MGMTSubnetAz3
+      RouteTableId: !Ref MGMTRouteTableAz3
+    DependsOn:
+      - MGMTSubnetAz3
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e776890c-d40d-45c0-ad1c-0d324962d072
+  MGMTSubnetRouteTableAssociation4:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayNotRequired4
+    Properties:
+      SubnetId: !Ref MGMTSubnetAz4
+      RouteTableId: !Ref MGMTRouteTableAz4
+    DependsOn:
+      - MGMTSubnetAz4
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: f4d42b58-2ba0-4a0b-b5a9-449d4b99dbd1
+  NAT1SubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired
+    Properties:
+      SubnetId: !Ref NATGWSubnetAz1
+      RouteTableId: !Ref NATGWRouteTableAz1
+    DependsOn:
+      - NATGWRouteTableAz1
+      - NATGWSubnetAz1
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e93888ce-6134-4419-8da4-b82c3716110d
+  NAT2SubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired
+    Properties:
+      SubnetId: !Ref NATGWSubnetAz2
+      RouteTableId: !Ref NATGWRouteTableAz2
+    DependsOn:
+      - NATGWRouteTableAz2
+      - NATGWSubnetAz2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: dde20ed4-da14-476a-b366-32c47fe32188
+  NAT3SubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired3
+    Properties:
+      SubnetId: !Ref NATGWSubnetAz3
+      RouteTableId: !Ref NATGWRouteTableAz3
+    DependsOn:
+      - NATGWRouteTableAz3
+      - NATGWSubnetAz3
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 9340803e-1d45-44bc-9bbf-a5233685bc43
+  NAT4SubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired4
+    Properties:
+      SubnetId: !Ref NATGWSubnetAz4
+      RouteTableId: !Ref NATGWRouteTableAz4
+    DependsOn:
+      - NATGWRouteTableAz4
+      - NATGWSubnetAz4
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: f72e9622-a24d-4f5e-aefd-1432697b4f05
+  MGMTSubnetRouteTableAssociationNAT1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired
+    Properties:
+      SubnetId: !Ref MGMTSubnetAz1
+      RouteTableId: !Ref MGMTRouteTableAz1
+    DependsOn:
+      - MGMTRouteNAT1
+      - MGMTSubnetAz1
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: c8814fa5-778c-4af1-884f-5764095ed856
+  MGMTSubnetRouteTableAssociationNAT2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired
+    Properties:
+      SubnetId: !Ref MGMTSubnetAz2
+      RouteTableId: !Ref MGMTRouteTableAz2
+    DependsOn:
+      - MGMTSubnetAz2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 42fe13e6-7801-4b23-91ec-aaf611f64c6d
+  MGMTSubnetRouteTableAssociationNAT3:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired3
+    Properties:
+      SubnetId: !Ref MGMTSubnetAz3
+      RouteTableId: !Ref MGMTRouteTableAz3
+    DependsOn:
+      - MGMTSubnetAz3
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 31fe1875-b6ee-4517-a4c9-e00f3e05d508
+  MGMTSubnetRouteTableAssociationNAT4:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: NATGatewayRequired4
+    Properties:
+      SubnetId: !Ref MGMTSubnetAz4
+      RouteTableId: !Ref MGMTRouteTableAz4
+    DependsOn:
+      - MGMTSubnetAz4
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: a4f32557-38b4-4ebb-9fb1-5286b6062d2d
+  UNTRUSTSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select 
+        - '0'
+        - !Ref VpcAzs
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '0'
+        - !Ref UntrustSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: UNTRUST
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - UNTRUSTSubnet1
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: d412a4f4-441a-4a38-8941-9cfba88af0a5
+  UNTRUSTSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select 
+        - '1'
+        - !Ref VpcAzs
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '1'
+        - !Ref UntrustSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: UNTRUST
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - UNTRUSTSubnet2
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 2a68ac80-7331-4af6-85e2-fc612bf487d3
+  UNTRUSTSubnet3:
+    Type: 'AWS::EC2::Subnet'
+    Condition: CreateSubnet3
+    Properties:
+      AvailabilityZone: !Select 
+        - '2'
+        - !Ref VpcAzs
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '2'
+        - !Ref UntrustSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: UNTRUST
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - UNTRUSTSubnet3
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: b365697e-3e78-4fe3-af7c-fc87ec4c0b96
+  UNTRUSTSubnet4:
+    Type: 'AWS::EC2::Subnet'
+    Condition: CreateSubnet4
+    Properties:
+      AvailabilityZone: !Select 
+        - '3'
+        - !Ref VpcAzs
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '3'
+        - !Ref UntrustSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: UNTRUST
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - UNTRUSTSubnet4
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 10ffddce-64c0-442a-bd36-1ba4b904cfb7
+  UNTRUSTRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: UNTRUST
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - UNTRUSTRouteTable
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: ea7b5728-5fbb-4198-af34-0260fba4afe6
+  UNTRUSTRoute:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref UNTRUSTRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn:
+      - InternetGateway
+      - UNTRUSTRouteTable
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 0684fad7-4e73-49b4-a8ba-9a1d87fc0de6
+  UNTRUSTSubnetRouteTableAssociation1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref UNTRUSTSubnet1
+      RouteTableId: !Ref UNTRUSTRouteTable
+    DependsOn:
+      - UNTRUSTRoute
+      - UNTRUSTSubnet1
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: f0fac0ad-ac7d-4d83-a856-ff9b5f72aeed
+  UNTRUSTSubnetRouteTableAssociation2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref UNTRUSTSubnet2
+      RouteTableId: !Ref UNTRUSTRouteTable
+    DependsOn:
+      - UNTRUSTRoute
+      - UNTRUSTSubnet2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: f8e8bee8-89ac-4d31-9cd9-4d521463106d
+  UNTRUSTSubnetRouteTableAssociation3:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: CreateSubnet3
+    Properties:
+      SubnetId: !Ref UNTRUSTSubnet3
+      RouteTableId: !Ref UNTRUSTRouteTable
+    DependsOn:
+      - UNTRUSTRoute
+      - UNTRUSTSubnet3
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: f101a7ba-cac7-4c9d-b79b-4000349edfb4
+  UNTRUSTSubnetRouteTableAssociation4:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: CreateSubnet4
+    Properties:
+      SubnetId: !Ref UNTRUSTSubnet4
+      RouteTableId: !Ref UNTRUSTRouteTable
+    DependsOn:
+      - UNTRUSTRoute
+      - UNTRUSTSubnet4
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 1833fc8f-a775-426e-a0d6-b161e3c24dac
+  TRUSTSubnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select 
+        - '0'
+        - !Ref VpcAzs
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '0'
+        - !Ref TrustSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: TRUST
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - TRUSTSubnet1
+    DependsOn:
+      - VPC
+      - InternetGateway
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e72075c6-799e-4adc-a10f-5c9121777974
+  TRUSTSubnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select 
+        - '1'
+        - !Ref VpcAzs
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '1'
+        - !Ref TrustSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: TRUST
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - TRUSTSubnet2
+    DependsOn:
+      - VPC
+      - InternetGateway
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 960e6c66-b286-4bc0-97cb-b8781f49aff8
+  TRUSTSubnet3:
+    Type: 'AWS::EC2::Subnet'
+    Condition: CreateSubnet3
+    Properties:
+      AvailabilityZone: !Select 
+        - '2'
+        - !Ref VpcAzs
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '2'
+        - !Ref TrustSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: TRUST
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - TRUSTSubnet3
+    DependsOn:
+      - VPC
+      - InternetGateway
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e352ebb8-bb2c-40e5-b77a-99274eb4990f
+  TRUSTSubnet4:
+    Type: 'AWS::EC2::Subnet'
+    Condition: CreateSubnet4
+    Properties:
+      AvailabilityZone: !Select 
+        - '3'
+        - !Ref VpcAzs
+      VpcId: !Ref VPC
+      CidrBlock: !Select 
+        - '3'
+        - !Ref TrustSubnetIpBlocks
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: TRUST
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - TRUSTSubnet4
+    DependsOn:
+      - VPC
+      - InternetGateway
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e2ca73a4-ea76-4319-b429-690466d1ef04
+  TRUSTRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Network
+          Value: TRUST
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - TRUSTRouteTable
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: ce89aacf-ec04-4a57-a596-6508eaf0c356
+  TRUSTRoute:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref TRUSTRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn:
+      - InternetGateway
+      - TRUSTRouteTable
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 7b7a8878-b312-4d70-9756-dd6e678eed59
+  TRUSTSubnetRouteTableAssociation1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref TRUSTSubnet1
+      RouteTableId: !Ref TRUSTRouteTable
+    DependsOn:
+      - TRUSTSubnet1
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 21e35cde-5da0-4fd1-971c-64e775d6306c
+  TRUSTSubnetRouteTableAssociation2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref TRUSTSubnet2
+      RouteTableId: !Ref TRUSTRouteTable
+    DependsOn:
+      - TRUSTSubnet2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 852cf89d-534b-4572-85df-5abff5de2c44
+  TRUSTSubnetRouteTableAssociation3:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: CreateSubnet3
+    Properties:
+      SubnetId: !Ref TRUSTSubnet3
+      RouteTableId: !Ref TRUSTRouteTable
+    DependsOn:
+      - TRUSTSubnet3
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 7a2ab225-2200-4aef-b30f-63f293bc3d44
+  TRUSTSubnetRouteTableAssociation4:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: CreateSubnet4
+    Properties:
+      SubnetId: !Ref TRUSTSubnet4
+      RouteTableId: !Ref TRUSTRouteTable
+    DependsOn:
+      - TRUSTSubnet4
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 35a6165b-dd7c-45f9-b832-6afacfc77b9f
+  PublicLoadBalancerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Public ELB Security Group with HTTP access on port 80 from the internet
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - PublicLoadBalancerSecurityGroup
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: bd247bfa-1079-48e3-b591-21fd1743da77
+  PublicElasticLoadBalancer:
+    Type: 'AWS::ElasticLoadBalancing::LoadBalancer'
+    Condition: CreateSubnet2
+    Properties:
+      LoadBalancerName: !Ref ELBName
+      SecurityGroups:
+        - !Ref PublicLoadBalancerSecurityGroup
+      Subnets:
+        - !Ref UNTRUSTSubnet1
+        - !Ref UNTRUSTSubnet2
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '80'
+          Protocol: HTTP
+      ConnectionDrainingPolicy:
+        Enabled: true
+        Timeout: 300
+      ConnectionSettings:
+        IdleTimeout: 300
+      CrossZone: true
+      HealthCheck:
+        Target: 'HTTP:80/index.html'
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+    DependsOn:
+      - VPC
+      - GatewayToInternet
+      - PublicLoadBalancerSecurityGroup
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 446892a6-6c82-462c-93d7-65546ef04369
+  PublicElasticLoadBalancer3:
+    Type: 'AWS::ElasticLoadBalancing::LoadBalancer'
+    Condition: CreateSubnet3
+    Properties:
+      LoadBalancerName: !Ref ELBName
+      SecurityGroups:
+        - !Ref PublicLoadBalancerSecurityGroup
+      Subnets:
+        - !Ref UNTRUSTSubnet1
+        - !Ref UNTRUSTSubnet2
+        - !Ref UNTRUSTSubnet3
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '80'
+          Protocol: HTTP
+      ConnectionDrainingPolicy:
+        Enabled: true
+        Timeout: 300
+      ConnectionSettings:
+        IdleTimeout: 300
+      CrossZone: true
+      HealthCheck:
+        Target: 'HTTP:80/index.html'
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+    DependsOn:
+      - VPC
+      - GatewayToInternet
+      - PublicLoadBalancerSecurityGroup
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 404c75f8-d29b-477c-8b4a-94c6487bac72
+  S3Endpoint2:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Condition: CreateSubnet2
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:ListBucket'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref MasterS3Bucket
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref MasterS3Bucket
+                - /*
+      RouteTableIds:
+        - !Ref UNTRUSTRouteTable
+      ServiceName: !Join 
+        - ''
+        - - com.amazonaws.
+          - !Ref 'AWS::Region'
+          - .s3
+      VpcId: !Ref VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: f2f56ed0-499f-4594-9a95-c8f84bb1f073
+  S3Endpoint3:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Condition: CreateSubnetAz3
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:ListBucket'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref MasterS3Bucket
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref MasterS3Bucket
+                - /*
+      RouteTableIds:
+        - !Ref UNTRUSTRouteTable
+      ServiceName: !Join 
+        - ''
+        - - com.amazonaws.
+          - !Ref 'AWS::Region'
+          - .s3
+      VpcId: !Ref VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e4adb218-a16d-4ba4-9d4e-83a91f7aef8f
+  S3Endpoint4:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Condition: CreateSubnet4
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:ListBucket'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref MasterS3Bucket
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref MasterS3Bucket
+                - /*
+      RouteTableIds:
+        - !Ref UNTRUSTRouteTable
+      ServiceName: !Join 
+        - ''
+        - - com.amazonaws.
+          - !Ref 'AWS::Region'
+          - .s3
+      VpcId: !Ref VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 92f88bdb-1562-474f-a85e-7f7d9d3c1659
+  PrivateLoadBalancerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: >-
+        Private ALB Security Group with HTTP access on port 80 from the
+        VM-Series firewall fleet 
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - PrivateLoadBalancerSecurityGroup
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0
+    DependsOn:
+      - VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 5e7792f9-3460-48f6-8e57-a3092d3803d1
+  PrivateElasticLoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Condition: CreateSubnet2
+    Properties:
+      Name: !Ref ILBName
+      SecurityGroups:
+        - !Ref PrivateLoadBalancerSecurityGroup
+      Subnets:
+        - !Ref TRUSTSubnet1
+        - !Ref TRUSTSubnet2
+      Scheme: internal
+    DependsOn:
+      - VPC
+      - GatewayToInternet
+      - PrivateLoadBalancerSecurityGroup
+      - TRUSTSubnet1
+      - TRUSTSubnet2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: d5ee0013-9e48-42c8-9b8c-9d069942e4f1
+  PrivateElasticLoadBalancer3:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Condition: CreateSubnet3
+    Properties:
+      Name: !Ref ILBName
+      SecurityGroups:
+        - !Ref PrivateLoadBalancerSecurityGroup
+      Subnets:
+        - !Ref TRUSTSubnet1
+        - !Ref TRUSTSubnet2
+        - !Ref TRUSTSubnet3
+      Scheme: internal
+    DependsOn:
+      - VPC
+      - GatewayToInternet
+      - PrivateLoadBalancerSecurityGroup
+      - TRUSTSubnet1
+      - TRUSTSubnet2
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: f89fb3e6-f896-49bf-a515-638f5e628313
+  WebServerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Allow access from HTTP and SSH traffic
+      Tags:
+        - Key: Name
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - WebServerSecurityGroup
+      SecurityGroupIngress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: !Ref VPCCIDR
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 77f7141e-c1a3-4429-b0ef-a574c2b48aaf
+  WebServerGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Condition: CreateSubnet2
+    DependsOn:
+      - VPC
+      - GatewayToInternet
+      - WebServerLaunchConfig
+      - InternetGateway
+      - TRUSTSubnet1
+      - TRUSTSubnet2
+    Properties:
+      AvailabilityZones:
+        - !Select 
+          - '0'
+          - !Ref VpcAzs
+        - !Select 
+          - '1'
+          - !Ref VpcAzs
+      LaunchConfigurationName: !Ref WebServerLaunchConfig
+      MinSize: '2'
+      MaxSize: '6'
+      TargetGroupARNs:
+        - !Ref WebServerTargetGroup
+      VPCZoneIdentifier:
+        - !Ref TRUSTSubnet1
+        - !Ref TRUSTSubnet2
+      Tags:
+        - ResourceType: auto-scaling-group
+          ResourceId: WebServerGroup
+          PropagateAtLaunch: true
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - WebServerGroup
+          Key: Name
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 0652e097-9b55-4f5b-916c-d7246f5eadd6
+  WebServerGroup3:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Condition: CreateSubnet3
+    DependsOn:
+      - VPC
+      - GatewayToInternet
+      - WebServerLaunchConfig
+      - InternetGateway
+      - TRUSTSubnet1
+      - TRUSTSubnet2
+      - TRUSTSubnet3
+    Properties:
+      AvailabilityZones:
+        - !Select 
+          - '0'
+          - !Ref VpcAzs
+        - !Select 
+          - '1'
+          - !Ref VpcAzs
+        - !Select 
+          - '2'
+          - !Ref VpcAzs
+      LaunchConfigurationName: !Ref WebServerLaunchConfig
+      MinSize: '3'
+      MaxSize: '9'
+      TargetGroupARNs:
+        - !Ref WebServerTargetGroup
+      VPCZoneIdentifier:
+        - !Ref TRUSTSubnet1
+        - !Ref TRUSTSubnet2
+        - !Ref TRUSTSubnet3
+      Tags:
+        - ResourceType: auto-scaling-group
+          ResourceId: WebServerGroup3
+          PropagateAtLaunch: true
+          Value: !Join 
+            - '-'
+            - - !Ref 'AWS::StackName'
+              - WebServerGroup3
+          Key: Name
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: ea4c1fa2-d000-498e-a646-151fa30ca2df
+  WebServerTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      HealthCheckPath: /index.html
+      HealthCheckPort: '80'
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: '10'
+      HealthyThresholdCount: '5'
+      Matcher:
+        HttpCode: '200'
+      Name: !Join 
+        - '-'
+        - - !Ref 'AWS::StackName'
+          - WebServerTargetGroup
+      Port: '80'
+      Protocol: HTTP
+      UnhealthyThresholdCount: '3'
+      VpcId: !Ref VPC
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 87f50c88-a4cf-42b4-b43a-4febfad4e0ff
+  WebServerLisitener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Condition: CreateSubnet2
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServerTargetGroup
+      LoadBalancerArn: !Ref PrivateElasticLoadBalancer
+      Port: '80'
+      Protocol: HTTP
+    DependsOn:
+      - WebServerTargetGroup
+      - PrivateElasticLoadBalancer
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 2662c8b9-5342-4232-bcf1-7b9d028ef38a
+  WebServerLisitener3:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Condition: CreateSubnet3
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServerTargetGroup
+      LoadBalancerArn: !Ref PrivateElasticLoadBalancer3
+      Port: '80'
+      Protocol: HTTP
+    DependsOn:
+      - WebServerTargetGroup
+      - PrivateElasticLoadBalancer3
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e0068c48-b7e1-4134-958e-9875ff9fcb96
+  WebServerLaunchConfig:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    DependsOn:
+      - VPC
+      - InternetGateway
+    Metadata:
+      Comment: Install a simple application
+      'AWS::CloudFormation::Init':
+        config:
+          packages:
+            yum:
+              httpd: []
+          files:
+            /var/www/html/index.html:
+              content: !Join 
+                - |+
+
+                - - >-
+                    <img
+                    src="https://www.paloaltonetworks.com/content/dam/pan/en_US/images/logos/brand/pan-logo-badge-blue-medium-kick-up.png"
+                    alt="VM-Series CloudFormation"/>
+                  - >-
+                    <h1>Congratulations, you have successfully launched
+                    VM-Series ASG CloudFormation. This file is coming from
+                    Webserver Region:
+                  - !Ref 'AWS::Region'
+                  - </h1>
+                  - '<h1>StackID: '
+                  - !Ref 'AWS::StackId'
+                  - </h1>
+                  - '<h1>StackName: '
+                  - !Ref 'AWS::StackName'
+                  - </h1>
+                  - '<h1>AccountID: '
+                  - !Ref 'AWS::AccountId'
+                  - </h1>
+                  - >-
+                    <h1>This templates creates - VPC, Subnets, Route Tables,
+                    Webservers ASG, Lambda Infra </h1>
+              mode: '000644'
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Join 
+                - ''
+                - - |
+                    [main]
+                  - stack=
+                  - !Ref 'AWS::StackId'
+                  - |+
+
+                  - region=
+                  - !Ref 'AWS::Region'
+                  - |+
+
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Join 
+                - ''
+                - - |
+                    [cfn-auto-reloader-hook]
+                  - |
+                    triggers=post.update
+                  - >
+                    path=Resources.LaunchConfig.Metadata.AWS::CloudFormation::Init
+                  - 'action=/opt/aws/bin/cfn-init -v '
+                  - '         --stack '
+                  - !Ref 'AWS::StackName'
+                  - '         --resource LaunchConfig '
+                  - '         --region '
+                  - !Ref 'AWS::Region'
+                  - |+
+
+                  - |
+                    runas=root
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+      'AWS::CloudFormation::Designer':
+        id: 1e321b48-5a13-4122-8982-582d16308bd8
+    Properties:
+      KeyName: !Ref KeyName
+      AssociatePublicIpAddress: 'true'
+      ImageId: !FindInMap 
+        - AWSRegionArch2AMI
+        - !Ref 'AWS::Region'
+        - !FindInMap 
+          - AWSInstanceType2Arch
+          - !Ref InstanceType
+          - Arch
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      InstanceType: !Ref InstanceType
+      UserData: !Base64 
+        'Fn::Join':
+          - ''
+          - - |
+              #!/bin/bash -xe
+            - |
+              yum update -y aws-cfn-bootstrap
+            - '/opt/aws/bin/cfn-init -v '
+            - '         --stack '
+            - !Ref 'AWS::StackName'
+            - '         --resource WebServerLaunchConfig'
+            - '         --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+            - |
+              # Signal completion
+            - '/opt/aws/bin/cfn-signal -e $? '
+            - '  --stack '
+            - !Ref 'AWS::StackName'
+            - '  --resource WebServerGroup'
+            - '  --region '
+            - !Ref 'AWS::Region'
+            - |+
+
+  WebServerScaleUpPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Condition: CreateSubnet2
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebServerGroup
+      Cooldown: '60'
+      ScalingAdjustment: '1'
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 6a80488a-6730-4295-b662-95bb2d3eded7
+  WebServerScaleDownPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Condition: CreateSubnet2
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebServerGroup
+      Cooldown: '60'
+      ScalingAdjustment: '-1'
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 1e486d5f-e263-4f72-9047-9b1bec40d678
+  WebServerScaleUpPolicy3:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Condition: CreateSubnet3
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebServerGroup3
+      Cooldown: '60'
+      ScalingAdjustment: '1'
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 75b26f35-6fcb-4822-91e0-79cbb1614c5c
+  WebServerScaleDownPolicy3:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Condition: CreateSubnet3
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref WebServerGroup3
+      Cooldown: '60'
+      ScalingAdjustment: '-1'
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 425e2bae-22d6-43a6-a2c1-08b2f190d989
+  CPUAlarmHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: CreateSubnet2
+    Properties:
+      AlarmDescription: Scale-up if CPU > 90% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '2'
+      Threshold: '90'
+      AlarmActions:
+        - !Ref WebServerScaleUpPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebServerGroup
+      ComparisonOperator: GreaterThanThreshold
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 9caaf190-d525-4aed-8534-c82911df43e6
+  CPUAlarmLow:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: CreateSubnet2
+    Properties:
+      AlarmDescription: Scale-down if CPU < 70% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '2'
+      Threshold: '70'
+      AlarmActions:
+        - !Ref WebServerScaleDownPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebServerGroup
+      ComparisonOperator: LessThanThreshold
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 156e9e37-6346-46cb-bce1-7307dae989be
+  CPUAlarmHigh3:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: CreateSubnet3
+    Properties:
+      AlarmDescription: Scale-up if CPU > 90% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '2'
+      Threshold: '90'
+      AlarmActions:
+        - !Ref WebServerScaleUpPolicy3
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebServerGroup3
+      ComparisonOperator: GreaterThanThreshold
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e2c20949-c99b-4090-87a9-516dcca17b6e
+  CPUAlarmLow3:
+    Type: 'AWS::CloudWatch::Alarm'
+    Condition: CreateSubnet3
+    Properties:
+      AlarmDescription: Scale-down if CPU < 70% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '2'
+      Threshold: '70'
+      AlarmActions:
+        - !Ref WebServerScaleDownPolicy3
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebServerGroup3
+      ComparisonOperator: LessThanThreshold
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: a1097c86-ced6-448e-814b-f5d38b94332e
+  az2n:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: NATGatewayRequired2
+    Properties:
+      TemplateURL: !Join 
+        - /
+        - - !FindInMap 
+            - Constants
+            - S3URL
+            - URL1
+          - !If 
+            - PANWCode
+            - !Join 
+              - ''
+              - - panw-aws-
+                - !Ref 'AWS::Region'
+                - /
+                - !FindInMap 
+                  - VersionMap
+                  - Version
+                  - Key
+            - !Ref PanS3BucketTpl
+          - !FindInMap 
+            - Constants
+            - S3MainTpl
+            - TPL1
+      Parameters:
+        VPCCIDR: !Ref VPCCIDR
+        ILBName: !Ref ILBName
+        ELBName: !Ref ELBName
+        MasterS3Bucket: !Ref MasterS3Bucket
+        SSHLocation: !Ref SSHLocation
+        FWInstanceType: !Ref FWInstanceType
+        PanFwAmiId: !Ref PanFwAmiId
+        VPCID: !Ref VPC
+        AZSubnetIDMgmt: !Join 
+          - ','
+          - - !Ref MGMTSubnetAz1
+            - !Ref MGMTSubnetAz2
+        AZSubnetIDUntrust: !Join 
+          - ','
+          - - !Ref UNTRUSTSubnet1
+            - !Ref UNTRUSTSubnet2
+        AZSubnetIDTrust: !Join 
+          - ','
+          - - !Ref TRUSTSubnet1
+            - !Ref TRUSTSubnet2
+        KeyName: !Ref KeyName
+        MinInstancesASG: !Ref MinInstancesASG
+        MaximumInstancesASG: !Ref MaximumInstancesASG
+        ScaleUpThreshold: !Ref ScaleUpThreshold
+        ScaleDownThreshold: !Ref ScaleDownThreshold
+        ScalingParameter: !Ref ScalingParameter
+        ScalingPeriod: !Ref ScalingPeriod
+        PanS3BucketTpl: !Ref PanS3BucketTpl
+        KeyPANWFirewall: !Ref KeyPANWFirewall
+        KeyPANWPanorama: !Ref KeyPANWPanorama
+        NATGateway: !Ref NATGateway
+        AZSubnetIDNATGW: !Join 
+          - ','
+          - - !Ref NATGWSubnetAz1
+            - !Ref NATGWSubnetAz2
+        AZSubnetIDLambda: !Join 
+          - ','
+          - - !Ref LambdaSubnetAz1
+            - !Ref LambdaSubnetAz2
+        KeyDeLicense: !Ref KeyDeLicense
+    DependsOn:
+      - VPC
+      - LambdaRoute1
+      - LambdaRoute2
+      - LambdaRouteTableAz1
+      - LambdaRouteTableAz2
+      - NATGWRoute1
+      - NATGWRoute2
+      - NAT1SubnetRouteTableAssociation
+      - NAT2SubnetRouteTableAssociation
+      - LambdaSubnetAz1
+      - LambdaSubnetAz2
+      - NAT1
+      - NAT2
+      - LambdaSubnetRouteTableAssociation1
+      - LambdaSubnetRouteTableAssociation2
+      - GatewayToInternet
+      - InternetGateway
+      - MGMTSubnetAz1
+      - MGMTSubnetAz2
+      - UNTRUSTSubnet1
+      - UNTRUSTSubnet2
+      - TRUSTSubnet1
+      - TRUSTSubnet2
+      - PublicElasticLoadBalancer
+      - PrivateElasticLoadBalancer
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: e725b7e2-25b4-4d42-b890-dd7c7aeafea8
+  az2:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: NATGatewayNotRequired2
+    DependsOn:
+      - VPC
+      - MGMTRouteTableAz1
+      - MGMTRouteTableAz2
+      - GatewayToInternet
+      - InternetGateway
+      - MGMTSubnetAz1
+      - MGMTSubnetAz2
+      - UNTRUSTSubnet1
+      - UNTRUSTSubnet2
+      - TRUSTSubnet1
+      - TRUSTSubnet2
+      - PublicElasticLoadBalancer
+      - PrivateElasticLoadBalancer
+    Properties:
+      TemplateURL: !Join 
+        - /
+        - - !FindInMap 
+            - Constants
+            - S3URL
+            - URL1
+          - !If 
+            - PANWCode
+            - !Join 
+              - ''
+              - - panw-aws-
+                - !Ref 'AWS::Region'
+                - /
+                - !FindInMap 
+                  - VersionMap
+                  - Version
+                  - Key
+            - !Ref PanS3BucketTpl
+          - !FindInMap 
+            - Constants
+            - S3MainTpl
+            - TPL1
+      Parameters:
+        VPCCIDR: !Ref VPCCIDR
+        ILBName: !Ref ILBName
+        ELBName: !Ref ELBName
+        MasterS3Bucket: !Ref MasterS3Bucket
+        SSHLocation: !Ref SSHLocation
+        FWInstanceType: !Ref FWInstanceType
+        PanFwAmiId: !Ref PanFwAmiId
+        VPCID: !Ref VPC
+        AZSubnetIDMgmt: !Join 
+          - ','
+          - - !Ref MGMTSubnetAz1
+            - !Ref MGMTSubnetAz2
+        AZSubnetIDUntrust: !Join 
+          - ','
+          - - !Ref UNTRUSTSubnet1
+            - !Ref UNTRUSTSubnet2
+        AZSubnetIDTrust: !Join 
+          - ','
+          - - !Ref TRUSTSubnet1
+            - !Ref TRUSTSubnet2
+        KeyName: !Ref KeyName
+        MinInstancesASG: !Ref MinInstancesASG
+        MaximumInstancesASG: !Ref MaximumInstancesASG
+        ScaleUpThreshold: !Ref ScaleUpThreshold
+        ScaleDownThreshold: !Ref ScaleDownThreshold
+        ScalingParameter: !Ref ScalingParameter
+        ScalingPeriod: !Ref ScalingPeriod
+        PanS3BucketTpl: !Ref PanS3BucketTpl
+        KeyPANWFirewall: !Ref KeyPANWFirewall
+        KeyPANWPanorama: !Ref KeyPANWPanorama
+        NATGateway: !Ref NATGateway
+        KeyDeLicense: !Ref KeyDeLicense
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 0cf4aa22-bc5f-4960-b60f-965bfce90d64
+  az3n:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: NATGatewayRequired3
+    DependsOn:
+      - VPC
+      - LambdaRouteTableAz1
+      - LambdaRouteTableAz2
+      - LambdaRouteTableAz3
+      - LambdaRoute1
+      - LambdaRoute2
+      - LambdaRoute3
+      - NATGWRoute1
+      - NATGWRoute2
+      - NATGWRoute3
+      - NAT1SubnetRouteTableAssociation
+      - NAT2SubnetRouteTableAssociation
+      - NAT3SubnetRouteTableAssociation
+      - LambdaSubnetAz1
+      - LambdaSubnetAz2
+      - NAT1
+      - NAT2
+      - NAT3
+      - LambdaSubnetRouteTableAssociation1
+      - LambdaSubnetRouteTableAssociation2
+      - LambdaSubnetRouteTableAssociation3
+      - GatewayToInternet
+      - InternetGateway
+      - MGMTSubnetAz1
+      - MGMTSubnetAz2
+      - MGMTSubnetAz3
+      - UNTRUSTSubnet1
+      - UNTRUSTSubnet2
+      - UNTRUSTSubnet3
+      - TRUSTSubnet1
+      - TRUSTSubnet2
+      - TRUSTSubnet3
+      - PrivateElasticLoadBalancer3
+      - PublicElasticLoadBalancer3
+    Properties:
+      TemplateURL: !Join 
+        - /
+        - - !FindInMap 
+            - Constants
+            - S3URL
+            - URL1
+          - !If 
+            - PANWCode
+            - !Join 
+              - ''
+              - - panw-aws-
+                - !Ref 'AWS::Region'
+                - /
+                - !FindInMap 
+                  - VersionMap
+                  - Version
+                  - Key
+            - !Ref PanS3BucketTpl
+          - !FindInMap 
+            - Constants
+            - S3MainTpl
+            - TPL1
+      Parameters:
+        VPCCIDR: !Ref VPCCIDR
+        ILBName: !Ref ILBName
+        ELBName: !Ref ELBName
+        MasterS3Bucket: !Ref MasterS3Bucket
+        FWInstanceType: !Ref FWInstanceType
+        PanFwAmiId: !Ref PanFwAmiId
+        SSHLocation: !Ref SSHLocation
+        VPCID: !Ref VPC
+        AZSubnetIDMgmt: !Join 
+          - ','
+          - - !Ref MGMTSubnetAz1
+            - !Ref MGMTSubnetAz2
+            - !Ref MGMTSubnetAz3
+        AZSubnetIDUntrust: !Join 
+          - ','
+          - - !Ref UNTRUSTSubnet1
+            - !Ref UNTRUSTSubnet2
+            - !Ref UNTRUSTSubnet3
+        AZSubnetIDTrust: !Join 
+          - ','
+          - - !Ref TRUSTSubnet1
+            - !Ref TRUSTSubnet2
+            - !Ref TRUSTSubnet3
+        KeyName: !Ref KeyName
+        MinInstancesASG: !Ref MinInstancesASG
+        MaximumInstancesASG: !Ref MaximumInstancesASG
+        ScaleUpThreshold: !Ref ScaleUpThreshold
+        ScaleDownThreshold: !Ref ScaleDownThreshold
+        ScalingParameter: !Ref ScalingParameter
+        ScalingPeriod: !Ref ScalingPeriod
+        PanS3BucketTpl: !Ref PanS3BucketTpl
+        KeyPANWFirewall: !Ref KeyPANWFirewall
+        KeyPANWPanorama: !Ref KeyPANWPanorama
+        NATGateway: !Ref NATGateway
+        AZSubnetIDNATGW: !Join 
+          - ','
+          - - !Ref NATGWSubnetAz1
+            - !Ref NATGWSubnetAz2
+            - !Ref NATGWSubnetAz3
+        AZSubnetIDLambda: !Join 
+          - ','
+          - - !Ref LambdaSubnetAz1
+            - !Ref LambdaSubnetAz2
+            - !Ref LambdaSubnetAz3
+        KeyDeLicense: !Ref KeyDeLicense
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 62388257-7e92-4b1d-8312-ee79a172ffa2
+  az3:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: NATGatewayNotRequired3
+    DependsOn:
+      - VPC
+      - MGMTRouteTableAz1
+      - MGMTRouteTableAz2
+      - MGMTRouteTableAz3
+      - GatewayToInternet
+      - InternetGateway
+      - MGMTSubnetAz1
+      - MGMTSubnetAz2
+      - MGMTSubnetAz3
+      - UNTRUSTSubnet1
+      - UNTRUSTSubnet2
+      - UNTRUSTSubnet3
+      - TRUSTSubnet1
+      - TRUSTSubnet2
+      - TRUSTSubnet3
+      - PrivateElasticLoadBalancer3
+      - PublicElasticLoadBalancer3
+    Properties:
+      TemplateURL: !Join 
+        - /
+        - - !FindInMap 
+            - Constants
+            - S3URL
+            - URL1
+          - !If 
+            - PANWCode
+            - !Join 
+              - ''
+              - - panw-aws-
+                - !Ref 'AWS::Region'
+                - /
+                - !FindInMap 
+                  - VersionMap
+                  - Version
+                  - Key
+            - !Ref PanS3BucketTpl
+          - !FindInMap 
+            - Constants
+            - S3MainTpl
+            - TPL1
+      Parameters:
+        VPCCIDR: !Ref VPCCIDR
+        ILBName: !Ref ILBName
+        ELBName: !Ref ELBName
+        MasterS3Bucket: !Ref MasterS3Bucket
+        FWInstanceType: !Ref FWInstanceType
+        PanFwAmiId: !Ref PanFwAmiId
+        SSHLocation: !Ref SSHLocation
+        VPCID: !Ref VPC
+        AZSubnetIDMgmt: !Join 
+          - ','
+          - - !Ref MGMTSubnetAz1
+            - !Ref MGMTSubnetAz2
+            - !Ref MGMTSubnetAz3
+        AZSubnetIDUntrust: !Join 
+          - ','
+          - - !Ref UNTRUSTSubnet1
+            - !Ref UNTRUSTSubnet2
+            - !Ref UNTRUSTSubnet3
+        AZSubnetIDTrust: !Join 
+          - ','
+          - - !Ref TRUSTSubnet1
+            - !Ref TRUSTSubnet2
+            - !Ref TRUSTSubnet3
+        KeyName: !Ref KeyName
+        MinInstancesASG: !Ref MinInstancesASG
+        MaximumInstancesASG: !Ref MaximumInstancesASG
+        ScaleUpThreshold: !Ref ScaleUpThreshold
+        ScaleDownThreshold: !Ref ScaleDownThreshold
+        ScalingParameter: !Ref ScalingParameter
+        ScalingPeriod: !Ref ScalingPeriod
+        PanS3BucketTpl: !Ref PanS3BucketTpl
+        KeyPANWFirewall: !Ref KeyPANWFirewall
+        KeyPANWPanorama: !Ref KeyPANWPanorama
+        NATGateway: !Ref NATGateway
+        KeyDeLicense: !Ref KeyDeLicense
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 2729cbec-85c1-4e12-b469-76e84e439d78
+  az4n:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: NATGatewayRequired4
+    DependsOn:
+      - GatewayToInternet
+      - InternetGateway
+      - MGMTSubnetAz1
+      - MGMTSubnetAz2
+      - MGMTSubnetAz3
+      - MGMTSubnetAz4
+      - UNTRUSTSubnet1
+      - UNTRUSTSubnet2
+      - UNTRUSTSubnet3
+      - UNTRUSTSubnet4
+      - TRUSTSubnet1
+      - TRUSTSubnet2
+      - TRUSTSubnet3
+      - TRUSTSubnet4
+    Properties:
+      TemplateURL: !Join 
+        - /
+        - - !FindInMap 
+            - Constants
+            - S3URL
+            - URL1
+          - !If 
+            - PANWCode
+            - !Join 
+              - ''
+              - - panw-aws-
+                - !Ref 'AWS::Region'
+                - /
+                - !FindInMap 
+                  - VersionMap
+                  - Version
+                  - Key
+            - !Ref PanS3BucketTpl
+          - !FindInMap 
+            - Constants
+            - S3MainTpl
+            - TPL1
+      Parameters:
+        VPCCIDR: !Ref VPCCIDR
+        ILBName: !Ref ILBName
+        ELBName: !Ref ELBName
+        MasterS3Bucket: !Ref MasterS3Bucket
+        FWInstanceType: !Ref FWInstanceType
+        PanFwAmiId: !Ref PanFwAmiId
+        SSHLocation: !Ref SSHLocation
+        VPCID: !Ref VPC
+        AZSubnetIDMgmt: !Join 
+          - ','
+          - - !Ref MGMTSubnetAz1
+            - !Ref MGMTSubnetAz2
+            - !Ref MGMTSubnetAz3
+            - !Ref MGMTSubnetAz4
+        AZSubnetIDUntrust: !Join 
+          - ','
+          - - !Ref UNTRUSTSubnet1
+            - !Ref UNTRUSTSubnet2
+            - !Ref UNTRUSTSubnet3
+            - !Ref UNTRUSTSubnet4
+        AZSubnetIDTrust: !Join 
+          - ','
+          - - !Ref TRUSTSubnet1
+            - !Ref TRUSTSubnet2
+            - !Ref TRUSTSubnet3
+            - !Ref TRUSTSubnet4
+        KeyName: !Ref KeyName
+        MinInstancesASG: !Ref MinInstancesASG
+        MaximumInstancesASG: !Ref MaximumInstancesASG
+        ScaleUpThreshold: !Ref ScaleUpThreshold
+        ScaleDownThreshold: !Ref ScaleDownThreshold
+        ScalingParameter: !Ref ScalingParameter
+        ScalingPeriod: !Ref ScalingPeriod
+        PanS3BucketTpl: !Ref PanS3BucketTpl
+        KeyPANWFirewall: !Ref KeyPANWFirewall
+        KeyPANWPanorama: !Ref KeyPANWPanorama
+        NATGateway: !Ref NATGateway
+        AZSubnetIDNATGW: !Join 
+          - ','
+          - - !Ref NATGWSubnetAz1
+            - !Ref NATGWSubnetAz2
+            - !Ref NATGWSubnetAz3
+            - !Ref NATGWSubnetAz4
+        AZSubnetIDLambda: !Join 
+          - ','
+          - - !Ref LambdaSubnetAz1
+            - !Ref LambdaSubnetAz2
+            - !Ref LambdaSubnetAz3
+            - !Ref LambdaSubnetAz4
+        KeyDeLicense: !Ref KeyDeLicense
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: bb241c1f-261f-4abc-96bd-cbececb5f6ae
+  az4:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: NATGatewayNotRequired4
+    DependsOn:
+      - GatewayToInternet
+      - InternetGateway
+      - MGMTSubnetAz1
+      - MGMTSubnetAz2
+      - MGMTSubnetAz3
+      - MGMTSubnetAz4
+      - UNTRUSTSubnet1
+      - UNTRUSTSubnet2
+      - UNTRUSTSubnet3
+      - UNTRUSTSubnet4
+      - TRUSTSubnet1
+      - TRUSTSubnet2
+      - TRUSTSubnet3
+      - TRUSTSubnet4
+    Properties:
+      TemplateURL: !Join 
+        - /
+        - - !FindInMap 
+            - Constants
+            - S3URL
+            - URL1
+          - !If 
+            - PANWCode
+            - !Join 
+              - ''
+              - - panw-aws-
+                - !Ref 'AWS::Region'
+                - /
+                - !FindInMap 
+                  - VersionMap
+                  - Version
+                  - Key
+            - !Ref PanS3BucketTpl
+          - !FindInMap 
+            - Constants
+            - S3MainTpl
+            - TPL1
+      Parameters:
+        VPCCIDR: !Ref VPCCIDR
+        ILBName: !Ref ILBName
+        ELBName: !Ref ELBName
+        MasterS3Bucket: !Ref MasterS3Bucket
+        FWInstanceType: !Ref FWInstanceType
+        PanFwAmiId: !Ref PanFwAmiId
+        SSHLocation: !Ref SSHLocation
+        VPCID: !Ref VPC
+        AZSubnetIDMgmt: !Join 
+          - ','
+          - - !Ref MGMTSubnetAz1
+            - !Ref MGMTSubnetAz2
+            - !Ref MGMTSubnetAz3
+            - !Ref MGMTSubnetAz4
+        AZSubnetIDUntrust: !Join 
+          - ','
+          - - !Ref UNTRUSTSubnet1
+            - !Ref UNTRUSTSubnet2
+            - !Ref UNTRUSTSubnet3
+            - !Ref UNTRUSTSubnet4
+        AZSubnetIDTrust: !Join 
+          - ','
+          - - !Ref TRUSTSubnet1
+            - !Ref TRUSTSubnet2
+            - !Ref TRUSTSubnet3
+            - !Ref TRUSTSubnet4
+        KeyName: !Ref KeyName
+        MinInstancesASG: !Ref MinInstancesASG
+        MaximumInstancesASG: !Ref MaximumInstancesASG
+        ScaleUpThreshold: !Ref ScaleUpThreshold
+        ScaleDownThreshold: !Ref ScaleDownThreshold
+        ScalingParameter: !Ref ScalingParameter
+        ScalingPeriod: !Ref ScalingPeriod
+        PanS3BucketTpl: !Ref PanS3BucketTpl
+        KeyPANWFirewall: !Ref KeyPANWFirewall
+        KeyPANWPanorama: !Ref KeyPANWPanorama
+        NATGateway: !Ref NATGateway
+        KeyDeLicense: !Ref KeyDeLicense
+    Metadata:
+      'AWS::CloudFormation::Designer':
+        id: 0dec2995-4670-4204-a5a5-ef6dea038aba
+Outputs:
+  ScalingParameter:
+    Value: !Ref ScalingParameter
+    Description: Scaling Parameter you have selected
+  ELBName:
+    Value: !Ref ELBName
+    Description: Elastic Load Balancer (Public)
+  DNSNamePublicELB:
+    Value: !If 
+      - CreateSubnet2
+      - !GetAtt 
+        - PublicElasticLoadBalancer
+        - CanonicalHostedZoneName
+      - !GetAtt 
+        - PublicElasticLoadBalancer3
+        - CanonicalHostedZoneName
+    Description: DNS Name for Elastic Load Balancer (Public)
+  ILBName:
+    Value: !Ref ILBName
+    Description: Internal Application Load Balancer (Private)
+  KeyName:
+    Value: !Ref KeyName
+    Description: Key Pair you have selected for SSH
+  SSHLocation:
+    Value: !Ref SSHLocation
+    Description: Make sure you SSH from this IP address
+  BootstrapS3Bucket:
+    Value: !Ref MasterS3Bucket
+    Description: Your Bootstrap bucket being used for this deployment
+  PanS3BucketTpl:
+    Value: !Join 
+      - ''
+      - - 'arn:aws:s3:::'
+        - !If 
+          - PANWCode
+          - !Join 
+            - '-'
+            - - panw-aws
+              - !Ref 'AWS::Region'
+          - !Ref PanS3BucketTpl
+    Description: Your Template/Lambda Code bucket being used for this deployment
+  TemplateVersion:
+    Value: !FindInMap 
+      - VersionMap
+      - Version
+      - Key
+    Description: Version of the VPC PANW template being used
